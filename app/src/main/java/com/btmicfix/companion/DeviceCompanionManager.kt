@@ -55,35 +55,45 @@ class DeviceCompanionManager(private val context: Context) {
 
         Logger.i("Starting CDM association flow")
 
-        cdm.associate(
-            associationRequest,
-            object : CompanionDeviceManager.Callback() {
-                override fun onAssociationPending(intentSender: IntentSender) {
-                    Logger.i("CDM association pending, launching picker")
-                    val request = IntentSenderRequest.Builder(intentSender).build()
-                    launcher.launch(request)
-                }
+        val callback = object : CompanionDeviceManager.Callback() {
+            override fun onAssociationPending(intentSender: IntentSender) {
+                Logger.i("CDM association pending, launching picker")
+                val request = IntentSenderRequest.Builder(intentSender).build()
+                launcher.launch(request)
+            }
 
-                @Deprecated("Deprecated in API 33+", ReplaceWith("onAssociationCreated"))
-                override fun onDeviceFound(intentSender: IntentSender) {
-                    // Legacy path for API 31-32
-                    Logger.i("CDM device found (legacy), launching picker")
-                    val request = IntentSenderRequest.Builder(intentSender).build()
-                    launcher.launch(request)
-                }
+            @Deprecated("Deprecated in API 33+", ReplaceWith("onAssociationCreated"))
+            override fun onDeviceFound(intentSender: IntentSender) {
+                // Legacy path for API 31-32
+                Logger.i("CDM device found (legacy), launching picker")
+                val request = IntentSenderRequest.Builder(intentSender).build()
+                launcher.launch(request)
+            }
 
-                override fun onAssociationCreated(associationInfo: AssociationInfo) {
-                    Logger.i("CDM association created: ${associationInfo.id}")
-                    // Start observing presence for this association
-                    startObservingPresence(associationInfo.id)
-                }
+            override fun onAssociationCreated(associationInfo: AssociationInfo) {
+                Logger.i("CDM association created: ${associationInfo.id}")
+                // Start observing presence for this association
+                startObservingPresence(associationInfo.id)
+            }
 
-                override fun onFailure(error: CharSequence?) {
-                    Logger.e("CDM association failed: $error")
-                }
-            },
-            null // Handler (null = main thread)
-        )
+            override fun onFailure(error: CharSequence?) {
+                Logger.e("CDM association failed: $error")
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            cdm.associate(
+                associationRequest,
+                context.mainExecutor,
+                callback
+            )
+        } else {
+            cdm.associate(
+                associationRequest,
+                callback,
+                null // Handler (null = main thread)
+            )
+        }
     }
 
     /**

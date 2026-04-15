@@ -4,6 +4,8 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+layout.buildDirectory.set(file("build_tmp"))
+
 android {
     namespace = "com.btmicfix"
     compileSdk = 34

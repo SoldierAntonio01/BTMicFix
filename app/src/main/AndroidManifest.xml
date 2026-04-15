@@ -12,6 +12,7 @@
     <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
     <uses-permission android:name="android.permission.REQUEST_COMPANION_USE_DATA_IN_BACKGROUND" />
     <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
 
     <!-- Foreground service for persistent routing notification -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -21,6 +22,11 @@
     <!-- Bluetooth feature declaration (not required, but informational) -->
     <uses-feature
         android:name="android.hardware.bluetooth"
+        android:required="true" />
+
+    <!-- Companion device setup feature is REQUIRED to use CompanionDeviceManager -->
+    <uses-feature
+        android:name="android.software.companion_device_setup"
         android:required="true" />
 
     <application

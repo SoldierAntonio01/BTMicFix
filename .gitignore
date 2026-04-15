@@ -3,6 +3,8 @@
 .kotlin/
 build/
 app/build/
+build_tmp/
+app/build_tmp/
 *.apk
 *.aab
 *.ap_
