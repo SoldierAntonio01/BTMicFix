@@ -1,9 +1,14 @@
 package com.btmicfix.audio
 
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.getSystemService
@@ -16,16 +21,18 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * BTMicFix Audio Routing Manager
  *
- * Routing priority:
+ * DIAGNOSTIC / STRICT LE AUDIO VERSION
  *
- * 1. Bluetooth LE Audio / BLE Headset
- *    Best available simultaneous playback + microphone route.
+ * Goal:
  *
- * 2. Bluetooth SCO / HFP
- *    Compatibility fallback. Microphone works, but media quality is lower.
+ * 1. Check whether the phone supports LE Audio.
+ * 2. Check whether the Buds are connected to Android's LE Audio profile.
+ * 3. Check whether Android exposes TYPE_BLE_HEADSET as a communication route.
+ * 4. Route ONLY through BLE Headset / LE Audio.
+ * 5. DO NOT silently fall back to HFP/SCO.
+ * 6. Keep the working 250 ms Voice Access watchdog.
  *
- * Also contains the watchdog that re-applies the communication route when
- * Voice Access or Samsung changes/drops it.
+ * This lets us determine exactly where Samsung is forcing HFP.
  */
 class AudioRoutingManager(
     private val context: Context
@@ -33,39 +40,159 @@ class AudioRoutingManager(
 
     private val audioManager: AudioManager =
         context.getSystemService<AudioManager>()
-            ?: throw IllegalStateException("AudioManager not available")
+            ?: throw IllegalStateException(
+                "AudioManager not available"
+            )
+
+    private val bluetoothManager: BluetoothManager? =
+        context.getSystemService<BluetoothManager>()
+
+    private val bluetoothAdapter: BluetoothAdapter?
+        get() = bluetoothManager?.adapter
 
     private val _routingState =
-        MutableStateFlow<RoutingState>(RoutingState.Idle)
+        MutableStateFlow<RoutingState>(
+            RoutingState.Idle
+        )
 
     val routingState: StateFlow<RoutingState> =
         _routingState.asStateFlow()
 
     private val _availableDevices =
-        MutableStateFlow<List<BluetoothAudioDevice>>(emptyList())
+        MutableStateFlow<
+            List<BluetoothAudioDevice>
+        >(emptyList())
 
-    val availableDevices: StateFlow<List<BluetoothAudioDevice>> =
+    val availableDevices:
+        StateFlow<List<BluetoothAudioDevice>> =
         _availableDevices.asStateFlow()
 
-    private var currentRoutedDevice: AudioDeviceInfo? = null
+    private var currentRoutedDevice:
+        AudioDeviceInfo? = null
+
+    /*
+     * ============================================================
+     * LE AUDIO PROFILE INFORMATION
+     * ============================================================
+     */
+
+    private var leAudioProfileConnected =
+        false
+
+    private var leAudioConnectedDeviceNames:
+        List<String> = emptyList()
+
+    private var leAudioProfileProxy:
+        BluetoothProfile? = null
+
+    private val leAudioProfileListener =
+        object : BluetoothProfile.ServiceListener {
+
+            override fun onServiceConnected(
+                profile: Int,
+                proxy: BluetoothProfile
+            ) {
+
+                if (
+                    Build.VERSION.SDK_INT >=
+                    Build.VERSION_CODES.TIRAMISU &&
+                    profile ==
+                    BluetoothProfile.LE_AUDIO
+                ) {
+
+                    leAudioProfileProxy =
+                        proxy
+
+                    try {
+
+                        val connected =
+                            proxy.connectedDevices
+
+                        leAudioProfileConnected =
+                            connected.isNotEmpty()
+
+                        leAudioConnectedDeviceNames =
+                            connected.map { device ->
+
+                                try {
+                                    device.name
+                                        ?: device.address
+                                } catch (_: SecurityException) {
+                                    "LE Audio Device"
+                                }
+                            }
+
+                        Logger.i(
+                            "LE Audio profile connected = " +
+                                leAudioProfileConnected
+                        )
+
+                        Logger.i(
+                            "LE Audio profile devices = " +
+                                leAudioConnectedDeviceNames
+                        )
+
+                    } catch (e: SecurityException) {
+
+                        leAudioProfileConnected =
+                            false
+
+                        leAudioConnectedDeviceNames =
+                            emptyList()
+
+                        Logger.e(
+                            "Unable to read LE Audio profile devices",
+                            e
+                        )
+                    }
+
+                    refreshAvailableDevices()
+                    logAudioDiagnostics()
+                }
+            }
+
+            override fun onServiceDisconnected(
+                profile: Int
+            ) {
+
+                if (
+                    Build.VERSION.SDK_INT >=
+                    Build.VERSION_CODES.TIRAMISU &&
+                    profile ==
+                    BluetoothProfile.LE_AUDIO
+                ) {
+
+                    leAudioProfileConnected =
+                        false
+
+                    leAudioConnectedDeviceNames =
+                        emptyList()
+
+                    leAudioProfileProxy =
+                        null
+
+                    Logger.w(
+                        "LE Audio profile disconnected"
+                    )
+
+                    logAudioDiagnostics()
+                }
+            }
+        }
 
     /*
      * ============================================================
      * WATCHDOG
      * ============================================================
-     *
-     * Checks the route every 250 ms.
-     *
-     * It does NOT record audio.
-     *
-     * If Voice Access or Samsung changes the communication device,
-     * BTMicFix re-applies the intended Bluetooth route.
      */
 
     private val watchdogHandler =
-        Handler(Looper.getMainLooper())
+        Handler(
+            Looper.getMainLooper()
+        )
 
-    private var watchdogRunning = false
+    private var watchdogRunning =
+        false
 
     private val watchdogRunnable =
         object : Runnable {
@@ -80,6 +207,7 @@ class AudioRoutingManager(
                     currentRoutedDevice
 
                 if (rememberedTarget == null) {
+
                     stopRouteWatchdog()
                     return
                 }
@@ -87,61 +215,63 @@ class AudioRoutingManager(
                 try {
 
                     val target =
-                        resolveTargetDevice(
+                        resolveBleTargetDevice(
                             rememberedTarget
                         )
 
-                    if (target == null) {
+                    val actual =
+                        audioManager.communicationDevice
 
-                        Logger.w(
-                            "Watchdog: Bluetooth target temporarily unavailable"
-                        )
+                    if (target != null) {
 
-                    } else {
-
-                        /*
-                         * Android may regenerate AudioDeviceInfo objects.
-                         * Keep our stored endpoint fresh.
-                         */
                         currentRoutedDevice =
                             target
 
-                        val actual =
-                            audioManager.communicationDevice
-
                         val routeCorrect =
                             actual != null &&
-                                samePhysicalDevice(
+                                sameBleDevice(
                                     actual,
                                     target
                                 )
 
                         val modeCorrect =
                             audioManager.mode ==
-                                AudioManager.MODE_IN_COMMUNICATION
+                                AudioManager
+                                    .MODE_IN_COMMUNICATION
 
-                        if (!routeCorrect || !modeCorrect) {
+                        if (
+                            !routeCorrect ||
+                            !modeCorrect
+                        ) {
 
                             Logger.w(
-                                "Watchdog restoring route. " +
+                                "Watchdog: BLE route dropped. " +
                                     "Actual=${actual?.productName} " +
-                                    "[${actual?.let { deviceTypeToString(it.type) }}], " +
+                                    "[${actual?.let {
+                                        deviceTypeToString(
+                                            it.type
+                                        )
+                                    }}], " +
                                     "Wanted=${target.productName} " +
-                                    "[${deviceTypeToString(target.type)}]"
+                                    "[BLE Headset / LE Audio]"
                             )
 
                             audioManager.mode =
-                                AudioManager.MODE_IN_COMMUNICATION
+                                AudioManager
+                                    .MODE_IN_COMMUNICATION
 
                             val success =
-                                audioManager.setCommunicationDevice(
-                                    target
-                                )
+                                audioManager
+                                    .setCommunicationDevice(
+                                        target
+                                    )
 
                             if (success) {
 
                                 val displayName =
-                                    buildDisplayName(target)
+                                    buildDisplayName(
+                                        target
+                                    )
 
                                 _routingState.value =
                                     RoutingState.Active(
@@ -149,23 +279,37 @@ class AudioRoutingManager(
                                     )
 
                                 Logger.i(
-                                    "✓ Watchdog restored " +
-                                        deviceTypeToString(target.type)
+                                    "✓ Watchdog restored BLE/LE Audio route"
                                 )
 
                             } else {
 
                                 Logger.w(
-                                    "Watchdog retry returned false"
+                                    "Watchdog: Android rejected BLE route retry"
                                 )
                             }
                         }
+
+                    } else {
+
+                        /*
+                         * IMPORTANT:
+                         *
+                         * We intentionally DO NOT grab HFP here.
+                         *
+                         * If Android removes TYPE_BLE_HEADSET,
+                         * keep checking for BLE instead.
+                         */
+
+                        Logger.w(
+                            "Watchdog: TYPE_BLE_HEADSET currently unavailable"
+                        )
                     }
 
                 } catch (e: Exception) {
 
                     Logger.e(
-                        "Watchdog route check failed",
+                        "BLE watchdog failed",
                         e
                     )
                 }
@@ -190,28 +334,35 @@ class AudioRoutingManager(
         object : AudioDeviceCallback() {
 
             override fun onAudioDevicesAdded(
-                addedDevices: Array<out AudioDeviceInfo>
+                addedDevices:
+                    Array<out AudioDeviceInfo>
             ) {
 
                 Logger.i(
                     "Audio devices added: ${
                         addedDevices.map {
-                            deviceTypeToString(it.type)
+                            deviceTypeToString(
+                                it.type
+                            )
                         }
                     }"
                 )
 
                 refreshAvailableDevices()
+                logAudioDiagnostics()
             }
 
             override fun onAudioDevicesRemoved(
-                removedDevices: Array<out AudioDeviceInfo>
+                removedDevices:
+                    Array<out AudioDeviceInfo>
             ) {
 
                 Logger.i(
                     "Audio devices removed: ${
                         removedDevices.map {
-                            deviceTypeToString(it.type)
+                            deviceTypeToString(
+                                it.type
+                            )
                         }
                     }"
                 )
@@ -221,21 +372,16 @@ class AudioRoutingManager(
 
                 if (remembered != null) {
 
-                    val removed =
+                    val targetWasRemoved =
                         removedDevices.any {
-                            it.id == remembered.id
+                            it.id ==
+                                remembered.id
                         }
 
-                    if (removed) {
+                    if (targetWasRemoved) {
 
-                        /*
-                         * Samsung can delete/recreate the endpoint while
-                         * changing Bluetooth profiles.
-                         *
-                         * Try to locate the new copy before giving up.
-                         */
                         val replacement =
-                            resolveTargetDevice(
+                            resolveBleTargetDevice(
                                 remembered
                             )
 
@@ -245,30 +391,34 @@ class AudioRoutingManager(
                                 replacement
 
                             Logger.i(
-                                "Bluetooth endpoint recreated as " +
-                                    deviceTypeToString(
-                                        replacement.type
-                                    )
+                                "BLE endpoint recreated by Android"
                             )
 
                         } else {
 
-                            Logger.w(
-                                "Routed Bluetooth device disappeared"
-                            )
+                            /*
+                             * Don't switch to HFP.
+                             *
+                             * The watchdog will wait for the
+                             * BLE endpoint to come back.
+                             */
 
-                            clearRouting()
+                            Logger.w(
+                                "BLE endpoint disappeared. " +
+                                    "NOT falling back to HFP."
+                            )
                         }
                     }
                 }
 
                 refreshAvailableDevices()
+                logAudioDiagnostics()
             }
         }
 
     /*
      * ============================================================
-     * STATE CLASSES
+     * STATE
      * ============================================================
      */
 
@@ -307,22 +457,23 @@ class AudioRoutingManager(
 
     /*
      * ============================================================
-     * MONITORING
+     * START MONITORING
      * ============================================================
      */
 
     fun startMonitoring() {
 
         Logger.i(
-            "Starting audio device monitoring"
+            "Starting audio monitoring"
         )
 
         try {
 
-            audioManager.registerAudioDeviceCallback(
-                deviceCallback,
-                null
-            )
+            audioManager
+                .registerAudioDeviceCallback(
+                    deviceCallback,
+                    null
+                )
 
         } catch (_: Exception) {
 
@@ -331,72 +482,212 @@ class AudioRoutingManager(
             )
         }
 
+        startLeAudioProfileCheck()
+
         refreshAvailableDevices()
+
+        logAudioDiagnostics()
     }
+
+    /*
+     * ============================================================
+     * STOP MONITORING
+     * ============================================================
+     */
 
     fun stopMonitoring() {
 
         Logger.i(
-            "Stopping audio device monitoring"
+            "Stopping audio monitoring"
         )
 
         try {
 
-            audioManager.unregisterAudioDeviceCallback(
-                deviceCallback
-            )
+            audioManager
+                .unregisterAudioDeviceCallback(
+                    deviceCallback
+                )
 
         } catch (_: Exception) {
+        }
 
-            // Already removed.
+        stopLeAudioProfileCheck()
+    }
+
+    /*
+     * ============================================================
+     * START LE AUDIO PROFILE CHECK
+     * ============================================================
+     */
+
+    private fun startLeAudioProfileCheck() {
+
+        if (
+            Build.VERSION.SDK_INT <
+            Build.VERSION_CODES.TIRAMISU
+        ) {
+
+            Logger.w(
+                "Android version is below Android 13. " +
+                    "LE Audio API unavailable."
+            )
+
+            return
+        }
+
+        val adapter =
+            bluetoothAdapter
+                ?: return
+
+        try {
+
+            val requested =
+                adapter.getProfileProxy(
+                    context,
+                    leAudioProfileListener,
+                    BluetoothProfile.LE_AUDIO
+                )
+
+            Logger.i(
+                "Requested LE Audio profile proxy = $requested"
+            )
+
+        } catch (e: SecurityException) {
+
+            Logger.e(
+                "Missing Bluetooth permission for LE profile",
+                e
+            )
+
+        } catch (e: Exception) {
+
+            Logger.e(
+                "Could not request LE Audio profile",
+                e
+            )
         }
     }
 
     /*
      * ============================================================
-     * MAIN ROUTING
+     * STOP LE AUDIO PROFILE CHECK
      * ============================================================
      */
 
+    private fun stopLeAudioProfileCheck() {
+
+        if (
+            Build.VERSION.SDK_INT <
+            Build.VERSION_CODES.TIRAMISU
+        ) {
+            return
+        }
+
+        val adapter =
+            bluetoothAdapter
+                ?: return
+
+        val proxy =
+            leAudioProfileProxy
+                ?: return
+
+        try {
+
+            adapter.closeProfileProxy(
+                BluetoothProfile.LE_AUDIO,
+                proxy
+            )
+
+        } catch (_: Exception) {
+        }
+
+        leAudioProfileProxy =
+            null
+    }
+
+    /*
+     * ============================================================
+     * ROUTE TO BLUETOOTH
+     * ============================================================
+     *
+     * STRICT BLE MODE:
+     *
+     * Even if the requested device is HFP,
+     * search for a BLE version first.
+     *
+     * If BLE doesn't exist:
+     *
+     * FAIL.
+     *
+     * DO NOT FALL BACK TO HFP.
+     */
+
     fun routeToBluetooth(
-        requestedDevice: AudioDeviceInfo
+        requestedDevice:
+            AudioDeviceInfo
     ): RoutingState {
 
-        /*
-         * If the caller selected SCO but the same Buds have a BLE
-         * communication endpoint, upgrade to BLE automatically.
-         */
-        val device =
-            preferBleVersionOfDevice(
+        val bleDevice =
+            findMatchingBleDevice(
                 requestedDevice
             )
 
-        val displayName =
-            buildDisplayName(device)
+        if (bleDevice == null) {
 
-        Logger.i(
-            "Attempting route to $displayName"
-        )
+            val diagnostic =
+                getAudioDiagnosticText()
+
+            val state =
+                RoutingState.Failed(
+                    "NO BLE HEADSET ROUTE\n\n" +
+                        diagnostic
+                )
+
+            _routingState.value =
+                state
+
+            Logger.e(
+                "STRICT BLE: No TYPE_BLE_HEADSET available"
+            )
+
+            Logger.e(
+                diagnostic
+            )
+
+            return state
+        }
+
+        val displayName =
+            buildDisplayName(
+                bleDevice
+            )
 
         _routingState.value =
             RoutingState.Routing(
                 displayName
             )
 
+        Logger.i(
+            "Attempting STRICT BLE route: " +
+                displayName
+        )
+
         try {
 
             audioManager.mode =
-                AudioManager.MODE_IN_COMMUNICATION
+                AudioManager
+                    .MODE_IN_COMMUNICATION
 
             val success =
-                audioManager.setCommunicationDevice(
-                    device
-                )
+                audioManager
+                    .setCommunicationDevice(
+                        bleDevice
+                    )
 
             if (success) {
 
                 currentRoutedDevice =
-                    device
+                    bleDevice
 
                 val state =
                     RoutingState.Active(
@@ -409,88 +700,39 @@ class AudioRoutingManager(
                 startRouteWatchdog()
 
                 Logger.i(
-                    "✓ Routing active: $displayName"
+                    "✓ BLE/LE AUDIO ROUTING ACTIVE"
+                )
+
+                logAudioDiagnostics()
+
+                return state
+
+            } else {
+
+                stopRouteWatchdog()
+
+                audioManager.mode =
+                    AudioManager.MODE_NORMAL
+
+                val diagnostic =
+                    getAudioDiagnosticText()
+
+                val state =
+                    RoutingState.Failed(
+                        "Android exposed BLE Headset " +
+                            "but rejected setCommunicationDevice().\n\n" +
+                            diagnostic
+                    )
+
+                _routingState.value =
+                    state
+
+                Logger.e(
+                    "Android rejected TYPE_BLE_HEADSET routing"
                 )
 
                 return state
             }
-
-            /*
-             * BLE endpoint was visible, but Samsung rejected it.
-             *
-             * Fall back to classic HFP/SCO so the Buds microphone
-             * still works.
-             */
-            if (
-                device.type ==
-                AudioDeviceInfo.TYPE_BLE_HEADSET
-            ) {
-
-                Logger.w(
-                    "BLE route rejected by Android. Trying HFP/SCO."
-                )
-
-                val sco =
-                    findScoFallback(
-                        device
-                    )
-
-                if (sco != null) {
-
-                    audioManager.mode =
-                        AudioManager.MODE_IN_COMMUNICATION
-
-                    val scoSuccess =
-                        audioManager.setCommunicationDevice(
-                            sco
-                        )
-
-                    if (scoSuccess) {
-
-                        currentRoutedDevice =
-                            sco
-
-                        val scoDisplayName =
-                            buildDisplayName(sco)
-
-                        val state =
-                            RoutingState.Active(
-                                scoDisplayName
-                            )
-
-                        _routingState.value =
-                            state
-
-                        startRouteWatchdog()
-
-                        Logger.w(
-                            "✓ HFP/SCO fallback active: " +
-                                scoDisplayName
-                        )
-
-                        return state
-                    }
-                }
-            }
-
-            stopRouteWatchdog()
-
-            audioManager.mode =
-                AudioManager.MODE_NORMAL
-
-            val state =
-                RoutingState.Failed(
-                    "Bluetooth communication routing failed"
-                )
-
-            _routingState.value =
-                state
-
-            Logger.e(
-                "✗ Could not establish Bluetooth communication route"
-            )
-
-            return state
 
         } catch (e: Exception) {
 
@@ -501,14 +743,18 @@ class AudioRoutingManager(
 
             val state =
                 RoutingState.Failed(
-                    e.message ?: "Unknown routing error"
+                    "BLE routing exception: " +
+                        (
+                            e.message
+                                ?: "Unknown error"
+                            )
                 )
 
             _routingState.value =
                 state
 
             Logger.e(
-                "✗ Exception during routing",
+                "BLE routing exception",
                 e
             )
 
@@ -518,41 +764,45 @@ class AudioRoutingManager(
 
     /*
      * ============================================================
-     * AUTOMATIC BEST-QUALITY DEVICE
+     * ROUTE TO FIRST AVAILABLE BLUETOOTH
      * ============================================================
      */
 
     fun routeToFirstAvailableBluetooth():
         RoutingState {
 
-        val device =
+        val bleDevice =
             findFirstBluetoothCommunicationDevice()
 
-        if (device == null) {
+        if (bleDevice == null) {
+
+            val diagnostic =
+                getAudioDiagnosticText()
 
             val state =
                 RoutingState.Failed(
-                    "No Bluetooth communication device found"
+                    "BLE HEADSET NOT AVAILABLE\n\n" +
+                        diagnostic
                 )
 
             _routingState.value =
                 state
 
-            Logger.w(
-                "No Bluetooth communication device available"
+            Logger.e(
+                diagnostic
             )
 
             return state
         }
 
         return routeToBluetooth(
-            device
+            bleDevice
         )
     }
 
     /*
      * ============================================================
-     * SAVED DEVICE ADDRESS
+     * ROUTE BY SAVED ADDRESS
      * ============================================================
      */
 
@@ -560,447 +810,138 @@ class AudioRoutingManager(
         address: String
     ): RoutingState {
 
-        val devices =
-            getAvailableCommunicationDevices()
+        val available =
+            audioManager
+                .availableCommunicationDevices
 
-        val exact =
-            devices.firstOrNull {
-                it.address == address
+        val savedDevice =
+            available.firstOrNull {
+                it.address ==
+                    address
             }
 
-        if (exact != null) {
+        /*
+         * Even if savedDevice is an HFP endpoint,
+         * routeToBluetooth() searches for its
+         * BLE equivalent.
+         */
 
-            /*
-             * routeToBluetooth() will automatically upgrade an SCO
-             * endpoint to BLE if a matching BLE endpoint exists.
-             */
+        if (savedDevice != null) {
+
             return routeToBluetooth(
-                exact
+                savedDevice
             )
         }
 
         Logger.w(
-            "Saved Bluetooth address ${
+            "Saved address ${
                 if (BuildConfig.DEBUG) {
                     address
                 } else {
                     "REDACTED"
                 }
-            } not exposed as communication endpoint. " +
-                "Trying best available connected headset."
+            } not directly available."
         )
+
+        /*
+         * Try any BLE headset.
+         */
 
         return routeToFirstAvailableBluetooth()
     }
 
     /*
      * ============================================================
-     * CLEAR ROUTING
-     * ============================================================
-     */
-
-    fun clearRouting() {
-
-        Logger.i(
-            "Clearing Bluetooth communication routing"
-        )
-
-        stopRouteWatchdog()
-
-        try {
-
-            audioManager.clearCommunicationDevice()
-
-            audioManager.mode =
-                AudioManager.MODE_NORMAL
-
-            currentRoutedDevice =
-                null
-
-            _routingState.value =
-                RoutingState.Idle
-
-            Logger.i(
-                "Routing cleared — normal media audio restored"
-            )
-
-        } catch (e: Exception) {
-
-            Logger.e(
-                "Error clearing routing",
-                e
-            )
-        }
-    }
-
-    /*
-     * ============================================================
-     * AVAILABLE COMMUNICATION DEVICES
-     * ============================================================
-     */
-
-    fun getAvailableCommunicationDevices():
-        List<AudioDeviceInfo> {
-
-        return audioManager.availableCommunicationDevices
-    }
-
-    /*
-     * ============================================================
-     * BEST QUALITY SELECTION
+     * FIND FIRST BLUETOOTH COMMUNICATION DEVICE
      * ============================================================
      *
-     * THIS IS THE IMPORTANT PART:
+     * STRICT:
      *
-     * BLE HEADSET FIRST
-     *
-     * HFP/SCO SECOND
+     * Only TYPE_BLE_HEADSET qualifies.
      */
 
     fun findFirstBluetoothCommunicationDevice():
         AudioDeviceInfo? {
 
         val devices =
-            audioManager.availableCommunicationDevices
+            audioManager
+                .availableCommunicationDevices
 
-        /*
-         * #1 — BEST CHOICE
-         *
-         * Bluetooth LE Audio / LC3 communication endpoint.
-         */
         val ble =
             devices.firstOrNull {
                 it.type ==
-                    AudioDeviceInfo.TYPE_BLE_HEADSET
+                    AudioDeviceInfo
+                        .TYPE_BLE_HEADSET
             }
 
         if (ble != null) {
 
             Logger.i(
-                "✓ BLE/LE Audio headset available: " +
+                "✓ TYPE_BLE_HEADSET FOUND: " +
                     "${ble.productName}"
             )
 
             return ble
         }
 
-        /*
-         * #2 — FALLBACK
-         *
-         * Classic Bluetooth Hands-Free Profile.
-         */
-        val sco =
+        val hfp =
             devices.firstOrNull {
                 it.type ==
-                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    AudioDeviceInfo
+                        .TYPE_BLUETOOTH_SCO
             }
 
-        if (sco != null) {
+        if (hfp != null) {
 
             Logger.w(
-                "BLE/LE Audio endpoint NOT available. " +
-                    "Falling back to HFP/SCO: " +
-                    "${sco.productName}"
+                "HFP exists but BLE does NOT. " +
+                    "HFP=${hfp.productName}"
             )
-
-            return sco
         }
-
-        Logger.w(
-            "No BLE Headset or HFP/SCO device available"
-        )
 
         return null
     }
 
     /*
      * ============================================================
-     * REAL ROUTE CHECK
+     * FIND MATCHING BLE DEVICE
      * ============================================================
      */
 
-    fun isBluetoothRouted():
-        Boolean {
-
-        val intended =
-            currentRoutedDevice
-                ?: return false
-
-        val actual =
-            audioManager.communicationDevice
-                ?: return false
-
-        return (
-            _routingState.value
-                is RoutingState.Active
-            ) &&
-            samePhysicalDevice(
-                actual,
-                intended
-            )
-    }
-
-    /*
-     * ============================================================
-     * WATCHDOG CONTROL
-     * ============================================================
-     */
-
-    private fun startRouteWatchdog() {
-
-        if (watchdogRunning) {
-            return
-        }
-
-        watchdogRunning =
-            true
-
-        watchdogHandler.removeCallbacks(
-            watchdogRunnable
-        )
-
-        watchdogHandler.post(
-            watchdogRunnable
-        )
-
-        Logger.i(
-            "Route watchdog started"
-        )
-    }
-
-    private fun stopRouteWatchdog() {
-
-        watchdogRunning =
-            false
-
-        watchdogHandler.removeCallbacks(
-            watchdogRunnable
-        )
-
-        Logger.i(
-            "Route watchdog stopped"
-        )
-    }
-
-    /*
-     * ============================================================
-     * FIND CURRENT COPY OF TARGET DEVICE
-     * ============================================================
-     */
-
-    private fun resolveTargetDevice(
-        remembered: AudioDeviceInfo
+    private fun findMatchingBleDevice(
+        original:
+            AudioDeviceInfo
     ): AudioDeviceInfo? {
 
         val devices =
             audioManager
                 .availableCommunicationDevices
-                .filter {
-                    isBluetoothCommunicationDevice(
-                        it
-                    )
-                }
-
-        /*
-         * Stay on the same Bluetooth transport whenever possible.
-         *
-         * If we successfully started on BLE, don't silently accept
-         * HFP just because Samsung regenerated the endpoint.
-         */
-        val sameType =
-            devices.filter {
-                it.type ==
-                    remembered.type
-            }
-
-        /*
-         * Same internal Android ID.
-         */
-        sameType.firstOrNull {
-            it.id ==
-                remembered.id
-        }?.let {
-            return it
-        }
-
-        /*
-         * Same Bluetooth address.
-         */
-        if (
-            remembered.address.isNotBlank()
-        ) {
-
-            sameType.firstOrNull {
-                it.address ==
-                    remembered.address
-            }?.let {
-                return it
-            }
-        }
-
-        /*
-         * Same product name.
-         */
-        val name =
-            remembered.productName
-                ?.toString()
-
-        if (!name.isNullOrBlank()) {
-
-            sameType.firstOrNull {
-                it.productName
-                    ?.toString() ==
-                    name
-            }?.let {
-                return it
-            }
-        }
-
-        /*
-         * Samsung regenerated the endpoint and there is only one
-         * endpoint of the requested transport.
-         */
-        if (sameType.size == 1) {
-
-            return sameType.first()
-        }
-
-        /*
-         * If we WERE using BLE but Samsung completely removed the
-         * BLE communication endpoint, preserve microphone function
-         * by falling back to SCO.
-         */
-        if (
-            remembered.type ==
-            AudioDeviceInfo.TYPE_BLE_HEADSET
-        ) {
-
-            val sco =
-                findScoFallback(
-                    remembered
-                )
-
-            if (sco != null) {
-
-                Logger.w(
-                    "BLE endpoint disappeared — " +
-                        "using HFP/SCO fallback"
-                )
-
-                return sco
-            }
-        }
-
-        /*
-         * Last resort:
-         * one BT communication endpoint remains.
-         */
-        return if (devices.size == 1) {
-
-            devices.first()
-
-        } else {
-
-            null
-        }
-    }
-
-    /*
-     * ============================================================
-     * ROUTE COMPARISON
-     * ============================================================
-     */
-
-    private fun samePhysicalDevice(
-        first: AudioDeviceInfo,
-        second: AudioDeviceInfo
-    ): Boolean {
-
-        /*
-         * IMPORTANT:
-         *
-         * BLE and SCO are intentionally considered DIFFERENT.
-         *
-         * Otherwise the watchdog could think everything was fine
-         * after Samsung silently changed:
-         *
-         * BLE -> HFP/SCO
-         */
-        if (
-            first.type !=
-            second.type
-        ) {
-            return false
-        }
-
-        if (
-            first.id ==
-            second.id
-        ) {
-            return true
-        }
-
-        if (
-            first.address.isNotBlank() &&
-            second.address.isNotBlank() &&
-            first.address ==
-                second.address
-        ) {
-            return true
-        }
-
-        val firstName =
-            first.productName
-                ?.toString()
-
-        val secondName =
-            second.productName
-                ?.toString()
-
-        return (
-            !firstName.isNullOrBlank() &&
-            firstName ==
-                secondName &&
-            isBluetoothCommunicationDevice(
-                first
-            ) &&
-            isBluetoothCommunicationDevice(
-                second
-            )
-        )
-    }
-
-    /*
-     * ============================================================
-     * UPGRADE SCO REQUEST TO BLE
-     * ============================================================
-     */
-
-    private fun preferBleVersionOfDevice(
-        original: AudioDeviceInfo
-    ): AudioDeviceInfo {
 
         /*
          * Already BLE.
          */
+
         if (
             original.type ==
             AudioDeviceInfo.TYPE_BLE_HEADSET
         ) {
+
             return original
         }
 
-        val devices =
-            audioManager.availableCommunicationDevices
-
         val originalName =
-            original.productName
+            original
+                .productName
                 ?.toString()
 
         /*
-         * Try to find a BLE endpoint with the same name.
+         * Same product name.
          */
-        if (!originalName.isNullOrBlank()) {
+
+        if (
+            !originalName
+                .isNullOrBlank()
+        ) {
 
             devices.firstOrNull {
 
@@ -1014,8 +955,8 @@ class AudioRoutingManager(
             }?.let {
 
                 Logger.i(
-                    "✓ Upgrading classic Bluetooth request " +
-                        "to matching BLE/LE Audio endpoint"
+                    "Found BLE equivalent for " +
+                        originalName
                 )
 
                 return it
@@ -1023,59 +964,75 @@ class AudioRoutingManager(
         }
 
         /*
-         * If exactly one BLE communication headset exists,
-         * it is almost certainly the connected Buds.
+         * If there is exactly one BLE headset,
+         * use it.
          */
+
         val bleDevices =
             devices.filter {
-
                 it.type ==
-                    AudioDeviceInfo.TYPE_BLE_HEADSET
+                    AudioDeviceInfo
+                        .TYPE_BLE_HEADSET
             }
 
-        if (bleDevices.size == 1) {
+        if (
+            bleDevices.size == 1
+        ) {
 
             Logger.i(
-                "✓ Using sole BLE/LE Audio headset instead of HFP"
+                "Using only available BLE headset"
             )
 
             return bleDevices.first()
         }
 
-        return original
+        return null
     }
 
     /*
      * ============================================================
-     * FIND HFP/SCO FALLBACK
+     * RESOLVE BLE TARGET
      * ============================================================
      */
 
-    private fun findScoFallback(
-        source: AudioDeviceInfo
+    private fun resolveBleTargetDevice(
+        remembered:
+            AudioDeviceInfo
     ): AudioDeviceInfo? {
 
-        val devices =
-            audioManager.availableCommunicationDevices
-
-        val sourceName =
-            source.productName
-                ?.toString()
+        val bleDevices =
+            audioManager
+                .availableCommunicationDevices
+                .filter {
+                    it.type ==
+                        AudioDeviceInfo
+                            .TYPE_BLE_HEADSET
+                }
 
         /*
-         * Prefer matching product name.
+         * Same Android ID.
          */
-        if (!sourceName.isNullOrBlank()) {
 
-            devices.firstOrNull {
+        bleDevices.firstOrNull {
+            it.id ==
+                remembered.id
+        }?.let {
 
-                it.type ==
-                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
+            return it
+        }
 
-                    it.productName
-                        ?.toString() ==
-                    sourceName
+        /*
+         * Same Bluetooth address.
+         */
 
+        if (
+            remembered.address
+                .isNotBlank()
+        ) {
+
+            bleDevices.firstOrNull {
+                it.address ==
+                    remembered.address
             }?.let {
 
                 return it
@@ -1083,18 +1040,38 @@ class AudioRoutingManager(
         }
 
         /*
-         * Otherwise use the only SCO headset.
+         * Same device name.
          */
-        val scoDevices =
-            devices.filter {
 
-                it.type ==
-                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        val rememberedName =
+            remembered
+                .productName
+                ?.toString()
+
+        if (
+            !rememberedName
+                .isNullOrBlank()
+        ) {
+
+            bleDevices.firstOrNull {
+                it.productName
+                    ?.toString() ==
+                    rememberedName
+            }?.let {
+
+                return it
             }
+        }
 
-        return if (scoDevices.size == 1) {
+        /*
+         * Only one BLE device.
+         */
 
-            scoDevices.first()
+        return if (
+            bleDevices.size == 1
+        ) {
+
+            bleDevices.first()
 
         } else {
 
@@ -1104,36 +1081,171 @@ class AudioRoutingManager(
 
     /*
      * ============================================================
-     * BLUETOOTH COMMUNICATION DEVICE CHECK
+     * REAL ROUTING CHECK
      * ============================================================
      */
 
-    private fun isBluetoothCommunicationDevice(
-        device: AudioDeviceInfo
-    ): Boolean {
+    fun isBluetoothRouted():
+        Boolean {
+
+        val target =
+            currentRoutedDevice
+                ?: return false
+
+        val actual =
+            audioManager
+                .communicationDevice
+                ?: return false
 
         return (
-            device.type ==
-                AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            _routingState.value
+                is RoutingState.Active
+            ) &&
+            sameBleDevice(
+                actual,
+                target
+            )
+    }
 
-            device.type ==
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+    /*
+     * ============================================================
+     * COMPARE BLE DEVICES
+     * ============================================================
+     */
+
+    private fun sameBleDevice(
+        first:
+            AudioDeviceInfo,
+        second:
+            AudioDeviceInfo
+    ): Boolean {
+
+        /*
+         * Both MUST actually be BLE.
+         */
+
+        if (
+            first.type !=
+            AudioDeviceInfo.TYPE_BLE_HEADSET
+        ) {
+
+            return false
+        }
+
+        if (
+            second.type !=
+            AudioDeviceInfo.TYPE_BLE_HEADSET
+        ) {
+
+            return false
+        }
+
+        if (
+            first.id ==
+            second.id
+        ) {
+
+            return true
+        }
+
+        if (
+            first.address
+                .isNotBlank() &&
+            second.address
+                .isNotBlank() &&
+            first.address ==
+                second.address
+        ) {
+
+            return true
+        }
+
+        val firstName =
+            first
+                .productName
+                ?.toString()
+
+        val secondName =
+            second
+                .productName
+                ?.toString()
+
+        return (
+            !firstName
+                .isNullOrBlank() &&
+            firstName ==
+                secondName
         )
     }
 
     /*
      * ============================================================
-     * UI / DEBUG DEVICE LIST
+     * CLEAR ROUTING
+     * ============================================================
+     */
+
+    fun clearRouting() {
+
+        Logger.i(
+            "Clearing BLE communication route"
+        )
+
+        stopRouteWatchdog()
+
+        try {
+
+            audioManager
+                .clearCommunicationDevice()
+
+            audioManager.mode =
+                AudioManager.MODE_NORMAL
+
+            currentRoutedDevice =
+                null
+
+            _routingState.value =
+                RoutingState.Idle
+
+            Logger.i(
+                "Routing cleared. SSC/UHQ media can resume."
+            )
+
+        } catch (e: Exception) {
+
+            Logger.e(
+                "Error clearing routing",
+                e
+            )
+        }
+    }
+
+    /*
+     * ============================================================
+     * AVAILABLE DEVICES
+     * ============================================================
+     */
+
+    fun getAvailableCommunicationDevices():
+        List<AudioDeviceInfo> {
+
+        return audioManager
+            .availableCommunicationDevices
+    }
+
+    /*
+     * ============================================================
+     * REFRESH DEVICE LIST
      * ============================================================
      */
 
     private fun refreshAvailableDevices() {
 
-        val communicationDevices =
-            audioManager.availableCommunicationDevices
+        val devices =
+            audioManager
+                .availableCommunicationDevices
 
-        val bluetoothDevices =
-            communicationDevices
+        val btDevices =
+            devices
                 .filter {
 
                     it.type ==
@@ -1147,9 +1259,6 @@ class AudioRoutingManager(
                 }
                 .sortedBy {
 
-                    /*
-                     * BLE first.
-                     */
                     when (it.type) {
 
                         AudioDeviceInfo.TYPE_BLE_HEADSET ->
@@ -1188,14 +1297,254 @@ class AudioRoutingManager(
                 }
 
         _availableDevices.value =
-            bluetoothDevices
+            btDevices
 
-        Logger.d(
-            "Available Bluetooth devices: ${
-                bluetoothDevices.map {
+        Logger.i(
+            "Communication devices = ${
+                btDevices.map {
                     "${it.name} [${it.typeLabel}]"
                 }
             }"
+        )
+    }
+
+    /*
+     * ============================================================
+     * LE AUDIO HARDWARE SUPPORT
+     * ============================================================
+     */
+
+    private fun getLeAudioHardwareSupport():
+        String {
+
+        if (
+            Build.VERSION.SDK_INT <
+            Build.VERSION_CODES.TIRAMISU
+        ) {
+
+            return "API unavailable"
+        }
+
+        val adapter =
+            bluetoothAdapter
+                ?: return "NO Bluetooth adapter"
+
+        return try {
+
+            when (
+                adapter.isLeAudioSupported
+            ) {
+
+                BluetoothStatusCodes.FEATURE_SUPPORTED ->
+                    "YES"
+
+                BluetoothStatusCodes.FEATURE_NOT_SUPPORTED ->
+                    "NO"
+
+                else ->
+                    "UNKNOWN"
+            }
+
+        } catch (e: SecurityException) {
+
+            "PERMISSION ERROR"
+
+        } catch (_: Exception) {
+
+            "UNKNOWN"
+        }
+    }
+
+    /*
+     * ============================================================
+     * FULL DIAGNOSTIC TEXT
+     * ============================================================
+     */
+
+    fun getAudioDiagnosticText():
+        String {
+
+        val devices =
+            audioManager
+                .availableCommunicationDevices
+
+        val bleRoute =
+            devices.firstOrNull {
+                it.type ==
+                    AudioDeviceInfo
+                        .TYPE_BLE_HEADSET
+            }
+
+        val hfpRoute =
+            devices.firstOrNull {
+                it.type ==
+                    AudioDeviceInfo
+                        .TYPE_BLUETOOTH_SCO
+            }
+
+        val current =
+            audioManager
+                .communicationDevice
+
+        val currentText =
+            if (current == null) {
+
+                "NONE"
+
+            } else {
+
+                "${current.productName} " +
+                    "[${deviceTypeToString(current.type)}]"
+            }
+
+        val leProfileNames =
+            if (
+                leAudioConnectedDeviceNames
+                    .isEmpty()
+            ) {
+
+                "NONE"
+
+            } else {
+
+                leAudioConnectedDeviceNames
+                    .joinToString(", ")
+            }
+
+        return buildString {
+
+            appendLine(
+                "===== BTMicFix LE AUDIO TEST ====="
+            )
+
+            appendLine(
+                "Phone LE Audio support: " +
+                    getLeAudioHardwareSupport()
+            )
+
+            appendLine(
+                "LE Audio profile connected: " +
+                    if (leAudioProfileConnected) {
+                        "YES"
+                    } else {
+                        "NO"
+                    }
+            )
+
+            appendLine(
+                "LE profile devices: " +
+                    leProfileNames
+            )
+
+            appendLine(
+                "BLE Headset route available: " +
+                    if (bleRoute != null) {
+                        "YES"
+                    } else {
+                        "NO"
+                    }
+            )
+
+            appendLine(
+                "HFP/SCO route available: " +
+                    if (hfpRoute != null) {
+                        "YES"
+                    } else {
+                        "NO"
+                    }
+            )
+
+            appendLine(
+                "Current communication route: " +
+                    currentText
+            )
+
+            if (bleRoute != null) {
+
+                appendLine(
+                    "BLE route name: " +
+                        "${bleRoute.productName}"
+                )
+
+                appendLine(
+                    "BLE route address: " +
+                        if (BuildConfig.DEBUG) {
+                            bleRoute.address
+                        } else {
+                            "REDACTED"
+                        }
+                )
+            }
+
+            if (hfpRoute != null) {
+
+                appendLine(
+                    "HFP route name: " +
+                        "${hfpRoute.productName}"
+                )
+            }
+
+            appendLine(
+                "================================="
+            )
+        }
+    }
+
+    /*
+     * ============================================================
+     * LOG DIAGNOSTICS
+     * ============================================================
+     */
+
+    private fun logAudioDiagnostics() {
+
+        Logger.i(
+            getAudioDiagnosticText()
+        )
+    }
+
+    /*
+     * ============================================================
+     * WATCHDOG CONTROL
+     * ============================================================
+     */
+
+    private fun startRouteWatchdog() {
+
+        if (watchdogRunning) {
+            return
+        }
+
+        watchdogRunning =
+            true
+
+        watchdogHandler
+            .removeCallbacks(
+                watchdogRunnable
+            )
+
+        watchdogHandler
+            .post(
+                watchdogRunnable
+            )
+
+        Logger.i(
+            "BLE route watchdog started"
+        )
+    }
+
+    private fun stopRouteWatchdog() {
+
+        watchdogRunning =
+            false
+
+        watchdogHandler
+            .removeCallbacks(
+                watchdogRunnable
+            )
+
+        Logger.i(
+            "BLE route watchdog stopped"
         )
     }
 
@@ -1206,15 +1555,17 @@ class AudioRoutingManager(
      */
 
     private fun buildDisplayName(
-        device: AudioDeviceInfo
+        device:
+            AudioDeviceInfo
     ): String {
 
         val name =
-            device.productName
+            device
+                .productName
                 ?.toString()
                 ?: "Bluetooth Device"
 
-        return "$name • ${deviceTypeToString(device.type)}"
+        return "$name • BLE Headset / LE Audio"
     }
 
     /*
@@ -1226,9 +1577,11 @@ class AudioRoutingManager(
     companion object {
 
         /*
-         * Your working Voice Access recovery interval.
+         * Keep your proven Voice Access watchdog speed.
          */
-        private const val WATCHDOG_INTERVAL_MS =
+
+        private const val
+            WATCHDOG_INTERVAL_MS =
             250L
 
         fun deviceTypeToString(
