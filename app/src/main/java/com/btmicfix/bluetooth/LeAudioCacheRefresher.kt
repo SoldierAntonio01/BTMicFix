@@ -15,56 +15,38 @@ import org.lsposed.hiddenapibypass.HiddenApiBypass
 import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
 import java.lang.reflect.InvocationTargetException
-import java.lang.reflect.Method
 import java.time.Duration
 
 /**
- * Refreshes Android's cached Bluetooth UUID information specifically
- * over the Bluetooth LE transport.
- *
- * WHY THIS EXISTS:
- *
- * Live GATT discovery on Antonio's Buds4 Pro proved:
- *
- * ASCS 0x184E = YES
- * PACS 0x1850 = YES
- * BASS 0x184F = YES
- *
- * But BluetoothDevice.getUuids() did NOT contain 184E / 1850.
- *
- * Android's LE Audio profile checks Android's own Bluetooth UUID cache.
- *
- * This class asks Android's Bluetooth stack to perform its own
- * transport-specific LE service discovery so the framework cache
- * can be updated properly.
- *
+ * Refreshes Android's Bluetooth UUID cache over TRANSPORT_LE.
  *
  * IMPORTANT:
  *
- * This class does NOT:
+ * The previous build incorrectly required BOTH:
  *
- * - modify LE Audio connection policy
- * - disconnect HFP
- * - disconnect A2DP
- * - connect the LE Audio profile
- * - change AudioManager routing
+ * ASCS 0x184E
+ * PACS 0x1850
  *
- * It ONLY requests:
+ * before allowing LE Audio connection.
  *
- * fetchRemoteUuids(
- *     device,
- *     TRANSPORT_LE
- * )
+ * AOSP LeAudioService.connect() actually checks only whether
+ * BluetoothUuid.LE_AUDIO is present in Android's remote UUID cache.
  *
- * through a Shizuku-wrapped Bluetooth Binder.
+ * On this Fold6, the transport-specific refresh produced:
+ *
+ * ASCS 0x184E = YES
+ * BASS 0x184F = YES
+ * PACS 0x1850 = NO
+ *
+ * Live GATT separately proved PACS 0x1850 really exists.
+ *
+ * Therefore:
+ *
+ * ASCS 0x184E in Android cache = READY FOR LE AUDIO CONNECT.
+ *
+ * PACS remains diagnostic information only.
  */
 object LeAudioCacheRefresher {
-
-    /*
-     * ============================================================
-     * CONSTANTS
-     * ============================================================
-     */
 
     private const val SHELL_UID =
         2000
@@ -72,21 +54,21 @@ object LeAudioCacheRefresher {
     private const val SHELL_PACKAGE =
         "com.android.shell"
 
+    /*
+     * Android's LE_AUDIO UUID gate.
+     */
     private const val ASCS_UUID =
         "0000184e-0000-1000-8000-00805f9b34fb"
 
+    /*
+     * Useful diagnostics only.
+     */
     private const val PACS_UUID =
         "00001850-0000-1000-8000-00805f9b34fb"
 
     private const val BASS_UUID =
         "0000184f-0000-1000-8000-00805f9b34fb"
 
-    /*
-     * Android's LE UUID discovery is asynchronous.
-     *
-     * A generous timeout gives Samsung's Bluetooth stack time to
-     * complete GATT service discovery and update its RemoteDevices cache.
-     */
     private const val CACHE_WAIT_MS =
         20000L
 
@@ -96,26 +78,26 @@ object LeAudioCacheRefresher {
     private const val RECEIVER_WAIT_SECONDS =
         5L
 
-    /*
-     * ============================================================
-     * RESULT
-     * ============================================================
-     */
-
     data class RefreshResult(
         val requestAccepted: Boolean,
+
+        /*
+         * IMPORTANT:
+         *
+         * cacheUpdated now means:
+         *
+         * Android has ASCS / LE_AUDIO UUID 0x184E.
+         *
+         * PACS is NOT required.
+         */
         val cacheUpdated: Boolean,
+
         val hasAscs: Boolean,
         val hasPacs: Boolean,
         val hasBass: Boolean,
+
         val text: String
     )
-
-    /*
-     * ============================================================
-     * PUBLIC ENTRY
-     * ============================================================
-     */
 
     fun refresh(
         context: Context,
@@ -123,9 +105,9 @@ object LeAudioCacheRefresher {
     ): RefreshResult {
 
         /*
-         * --------------------------------------------------------
-         * BLUETOOTH PERMISSION
-         * --------------------------------------------------------
+         * ========================================================
+         * PERMISSION
+         * ========================================================
          */
 
         if (
@@ -144,9 +126,9 @@ object LeAudioCacheRefresher {
         }
 
         /*
-         * --------------------------------------------------------
+         * ========================================================
          * SHIZUKU
-         * --------------------------------------------------------
+         * ========================================================
          */
 
         try {
@@ -190,15 +172,9 @@ object LeAudioCacheRefresher {
         }
 
         /*
-         * --------------------------------------------------------
-         * HIDDEN API EXEMPTION
-         * --------------------------------------------------------
-         *
-         * HiddenApiBypass only lets us reach Android's hidden Java
-         * framework interfaces.
-         *
-         * The actual privileged Binder call still goes through
-         * Shizuku.
+         * ========================================================
+         * HIDDEN API ACCESS
+         * ========================================================
          */
 
         try {
@@ -218,7 +194,7 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * NORMAL BLUETOOTH ADAPTER
+         * BLUETOOTH ADAPTER
          * ========================================================
          */
 
@@ -320,25 +296,13 @@ object LeAudioCacheRefresher {
 
         if (device == null) {
 
-            val paired =
-                bondedDevices
-                    .joinToString(
-                        separator = "\n"
-                    ) {
-
-                        safeDeviceLabel(it)
-                    }
-
             return failure(
                 """
-                Could not identify Antonio's Buds4 Pro.
+                Could not identify:
 
-                Selected:
                 $preferredDeviceName
 
-                Paired devices:
-
-                $paired
+                in Android's paired Bluetooth devices.
                 """.trimIndent()
             )
         }
@@ -348,7 +312,7 @@ object LeAudioCacheRefresher {
                 device
             )
 
-        val address =
+        val maskedAddress =
             maskAddress(
                 try {
                     device.address
@@ -359,7 +323,7 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * CACHE BEFORE
+         * READ CACHE BEFORE REFRESH
          * ========================================================
          */
 
@@ -387,14 +351,18 @@ object LeAudioCacheRefresher {
             )
 
         /*
-         * If Android already has the required LE Audio UUIDs,
-         * there is nothing to refresh.
+         * ========================================================
+         * IMPORTANT CHANGE
+         * ========================================================
+         *
+         * If 184E is already cached, we are DONE.
+         *
+         * Do NOT wait for PACS.
+         *
+         * Android LeAudioService.connect() checks LE_AUDIO / 184E.
          */
 
-        if (
-            beforeAscs &&
-            beforePacs
-        ) {
+        if (beforeAscs) {
 
             return RefreshResult(
                 requestAccepted =
@@ -407,7 +375,7 @@ object LeAudioCacheRefresher {
                     true,
 
                 hasPacs =
-                    true,
+                    beforePacs,
 
                 hasBass =
                     beforeBass,
@@ -415,29 +383,40 @@ object LeAudioCacheRefresher {
                 text =
                     """
                     ===== BTMicFix ANDROID LE CACHE =====
-                    CACHE ALREADY READY
+                    READY
 
                     Device:
                     $deviceName
 
                     Address:
-                    $address
+                    $maskedAddress
 
-                    BEFORE CACHE:
 
-                    ASCS 0x184E:
+                    ANDROID CACHE
+
+                    ASCS / LE_AUDIO 0x184E:
                     YES
 
                     PACS 0x1850:
-                    YES
+                    ${yesNo(beforePacs)}
 
                     BASS 0x184F:
                     ${yesNo(beforeBass)}
 
-                    Android already has the core
-                    LE Audio UUIDs in its cache.
 
-                    No UUID refresh was necessary.
+                    IMPORTANT:
+
+                    Android now has the LE_AUDIO
+                    UUID required by LeAudioService.
+
+                    PACS 0x1850 is NOT required
+                    in this cached UUID list for
+                    LeAudioService.connect().
+
+                    Live GATT already proved that
+                    PACS exists on the Buds.
+
+                    READY FOR LE AUDIO CONNECT.
 
                     =====================================
                     """.trimIndent()
@@ -446,13 +425,8 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * GET REAL IBluetooth SERVICE
+         * GET IBluetooth SERVICE
          * ========================================================
-         *
-         * BluetoothAdapter internally talks to IBluetooth.
-         *
-         * We obtain that existing service interface from the normal
-         * app process, then wrap only its Binder with Shizuku.
          */
 
         val rawBluetoothService =
@@ -478,14 +452,14 @@ object LeAudioCacheRefresher {
 
                     return failure(
                         """
-                        Could not obtain Android's hidden
-                        IBluetooth service.
+                        Could not obtain Android's
+                        hidden IBluetooth service.
 
-                        First attempt:
+                        First:
                         ${first.javaClass.simpleName}
                         ${first.message}
 
-                        Second attempt:
+                        Second:
                         ${second.javaClass.simpleName}
                         ${second.message}
                         """.trimIndent()
@@ -510,10 +484,8 @@ object LeAudioCacheRefresher {
 
             return failure(
                 """
-                Android returned an unexpected Bluetooth
-                service object.
+                Unexpected Bluetooth service type:
 
-                Type:
                 ${rawBluetoothService.javaClass.name}
                 """.trimIndent()
             )
@@ -531,7 +503,7 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * WRAP IBluetooth WITH SHIZUKU
+         * WRAP BINDER THROUGH SHIZUKU
          * ========================================================
          */
 
@@ -546,7 +518,7 @@ object LeAudioCacheRefresher {
 
                 return failure(
                     """
-                    Could not create Shizuku Binder wrapper.
+                    Shizuku Binder wrapper failed.
 
                     ${e.javaClass.name}
 
@@ -554,14 +526,6 @@ object LeAudioCacheRefresher {
                     """.trimIndent()
                 )
             }
-
-        /*
-         * Recreate:
-         *
-         * android.bluetooth.IBluetooth
-         *
-         * around the Shizuku-wrapped Binder.
-         */
 
         val stubClass =
             try {
@@ -574,7 +538,7 @@ object LeAudioCacheRefresher {
 
                 return failure(
                     """
-                    Could not load IBluetooth.Stub.
+                    IBluetooth.Stub could not be loaded.
 
                     ${e.javaClass.name}
 
@@ -597,7 +561,7 @@ object LeAudioCacheRefresher {
 
                 return failure(
                     """
-                    Could not create Shizuku-wrapped
+                    Could not create privileged
                     IBluetooth interface.
 
                     ${e.javaClass.name}
@@ -610,47 +574,29 @@ object LeAudioCacheRefresher {
         if (privilegedService == null) {
 
             return failure(
-                """
-                IBluetooth.Stub.asInterface()
-                returned NULL.
-                """.trimIndent()
+                "IBluetooth.Stub.asInterface returned NULL."
             )
         }
 
         /*
          * ========================================================
-         * SHELL ATTRIBUTION SOURCE
+         * SHELL ATTRIBUTION
          * ========================================================
          */
 
         val shellSource =
-            try {
-
-                AttributionSource
-                    .Builder(
-                        SHELL_UID
-                    )
-                    .setPackageName(
-                        SHELL_PACKAGE
-                    )
-                    .build()
-
-            } catch (e: Throwable) {
-
-                return failure(
-                    """
-                    Could not create shell AttributionSource.
-
-                    ${e.javaClass.name}
-
-                    ${e.message}
-                    """.trimIndent()
+            AttributionSource
+                .Builder(
+                    SHELL_UID
                 )
-            }
+                .setPackageName(
+                    SHELL_PACKAGE
+                )
+                .build()
 
         /*
          * ========================================================
-         * FETCH UUIDS SPECIFICALLY OVER LE
+         * FETCH REMOTE UUIDS OVER LE
          * ========================================================
          */
 
@@ -713,26 +659,13 @@ object LeAudioCacheRefresher {
                     $deviceName
 
                     Address:
-                    $address
+                    $maskedAddress
 
                     Binder method:
                     ${fetchResult.signature}
 
-                    Android rejected the transport-specific
+                    Android rejected the
                     LE UUID refresh request.
-
-                    BEFORE CACHE:
-
-                    ASCS 0x184E:
-                    ${yesNo(beforeAscs)}
-
-                    PACS 0x1850:
-                    ${yesNo(beforePacs)}
-
-                    BASS 0x184F:
-                    ${yesNo(beforeBass)}
-
-                    No LE Audio connect request was issued.
 
                     =====================================
                     """.trimIndent()
@@ -741,16 +674,21 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * WAIT FOR ANDROID'S CACHE TO UPDATE
+         * WAIT ONLY FOR 184E
          * ========================================================
          *
-         * fetchRemoteUuids() is asynchronous.
+         * THIS IS THE KEY CHANGE.
          *
-         * We repeatedly ask BluetoothDevice.getUuids() until the
-         * LE Audio UUIDs appear or the timeout expires.
+         * Previously:
+         *
+         * wait for 184E && 1850
+         *
+         * Now:
+         *
+         * wait for 184E
          */
 
-        val start =
+        val startTime =
             System.currentTimeMillis()
 
         var after =
@@ -778,14 +716,15 @@ object LeAudioCacheRefresher {
 
         while (
             System.currentTimeMillis() -
-            start <
+                startTime <
             CACHE_WAIT_MS
         ) {
 
-            if (
-                afterAscs &&
-                afterPacs
-            ) {
+            /*
+             * 184E alone means Android's LE Audio
+             * connection gate can now succeed.
+             */
+            if (afterAscs) {
 
                 break
             }
@@ -827,24 +766,19 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * SUCCESS
+         * SUCCESS WHEN 184E APPEARS
          * ========================================================
          */
 
-        if (
-            afterAscs &&
-            afterPacs
-        ) {
-
-            val afterText =
-                uuidListText(
-                    after
-                )
+        if (afterAscs) {
 
             return RefreshResult(
                 requestAccepted =
                     true,
 
+                /*
+                 * Cache is sufficiently ready for LE Audio.
+                 */
                 cacheUpdated =
                     true,
 
@@ -852,7 +786,7 @@ object LeAudioCacheRefresher {
                     true,
 
                 hasPacs =
-                    true,
+                    afterPacs,
 
                 hasBass =
                     afterBass,
@@ -860,13 +794,13 @@ object LeAudioCacheRefresher {
                 text =
                     """
                     ===== BTMicFix ANDROID LE CACHE =====
-                    SUCCESS
+                    SUCCESS - LE AUDIO UUID READY
 
                     Device:
                     $deviceName
 
                     Address:
-                    $address
+                    $maskedAddress
 
                     Binder method:
                     ${fetchResult.signature}
@@ -877,7 +811,7 @@ object LeAudioCacheRefresher {
 
                     BEFORE CACHE
 
-                    ASCS 0x184E:
+                    ASCS / LE_AUDIO 0x184E:
                     ${yesNo(beforeAscs)}
 
                     PACS 0x1850:
@@ -889,26 +823,24 @@ object LeAudioCacheRefresher {
 
                     AFTER CACHE
 
-                    ASCS 0x184E:
+                    ASCS / LE_AUDIO 0x184E:
                     YES
 
                     PACS 0x1850:
-                    YES
+                    ${yesNo(afterPacs)}
 
                     BASS 0x184F:
                     ${yesNo(afterBass)}
 
 
-                    Android's own Bluetooth UUID cache
-                    now contains the core LE Audio services.
+                    Android now contains the UUID
+                    required by LeAudioService.connect().
 
-                    It is now safe for BTMicFix to attempt
-                    the LE Audio profile connection.
+                    PACS does not need to appear in
+                    BluetoothDevice.getUuids() for the
+                    LE Audio connection gate.
 
-
-                    CACHED UUIDS AFTER REFRESH:
-
-                    $afterText
+                    READY FOR LE AUDIO CONNECT.
 
                     =====================================
                     """.trimIndent()
@@ -917,14 +849,11 @@ object LeAudioCacheRefresher {
 
         /*
          * ========================================================
-         * REQUEST ACCEPTED, BUT CACHE DID NOT CHANGE
+         * REAL FAILURE
          * ========================================================
+         *
+         * Only fail if 184E is STILL missing.
          */
-
-        val afterText =
-            uuidListText(
-                after
-            )
 
         return RefreshResult(
             requestAccepted =
@@ -934,7 +863,7 @@ object LeAudioCacheRefresher {
                 false,
 
             hasAscs =
-                afterAscs,
+                false,
 
             hasPacs =
                 afterPacs,
@@ -945,38 +874,21 @@ object LeAudioCacheRefresher {
             text =
                 """
                 ===== BTMicFix ANDROID LE CACHE =====
-                REFRESH DID NOT COMPLETE
+                LE AUDIO UUID STILL MISSING
 
                 Device:
                 $deviceName
 
                 Address:
-                $address
+                $maskedAddress
 
                 Binder method:
                 ${fetchResult.signature}
 
-                Android ACCEPTED the transport-specific
-                LE UUID refresh request.
-
-                But the framework cache did not contain
-                both core LE Audio UUIDs within
+                Android accepted the refresh request,
+                but ASCS / LE_AUDIO 0x184E still did
+                not appear within
                 ${CACHE_WAIT_MS / 1000} seconds.
-
-
-                BEFORE CACHE
-
-                ASCS 0x184E:
-                ${yesNo(beforeAscs)}
-
-                PACS 0x1850:
-                ${yesNo(beforePacs)}
-
-
-                AFTER CACHE
-
-                ASCS 0x184E:
-                ${yesNo(afterAscs)}
 
                 PACS 0x1850:
                 ${yesNo(afterPacs)}
@@ -984,13 +896,8 @@ object LeAudioCacheRefresher {
                 BASS 0x184F:
                 ${yesNo(afterBass)}
 
-
-                No LE Audio profile connection was
-                attempted after this result.
-
-                Current cached UUIDs:
-
-                $afterText
+                No LE Audio profile connection
+                should be attempted.
 
                 =====================================
                 """.trimIndent()
@@ -999,12 +906,8 @@ object LeAudioCacheRefresher {
 
     /*
      * ============================================================
-     * CALL fetchRemoteUuids()
+     * FETCH REMOTE UUIDS
      * ============================================================
-     *
-     * Android has used more than one hidden Binder signature.
-     *
-     * We detect the exact signature at runtime.
      */
 
     private fun callFetchRemoteUuids(
@@ -1028,15 +931,68 @@ object LeAudioCacheRefresher {
 
         /*
          * --------------------------------------------------------
-         * MODERN AIDL FORM
+         * DIRECT SAMSUNG / ANDROID FORM
          * --------------------------------------------------------
+         *
+         * This is the form your Fold6 already proved works:
          *
          * fetchRemoteUuids(
          *     BluetoothDevice,
-         *     int transport,
-         *     AttributionSource,
-         *     SynchronousResultReceiver
+         *     int,
+         *     AttributionSource
          * )
+         */
+
+        val directMethod =
+            methods.firstOrNull { method ->
+
+                val types =
+                    method.parameterTypes
+
+                types.size == 3 &&
+
+                    types[0] ==
+                        BluetoothDevice::class.java &&
+
+                    types[1] ==
+                        Int::class.javaPrimitiveType &&
+
+                    types[2].name ==
+                        "android.content.AttributionSource"
+            }
+
+        if (
+            directMethod !=
+            null
+        ) {
+
+            directMethod.isAccessible =
+                true
+
+            val response =
+                directMethod.invoke(
+                    service,
+                    device,
+                    BluetoothDevice.TRANSPORT_LE,
+                    attributionSource
+                )
+
+            return FetchCallResult(
+                accepted =
+                    response as? Boolean
+                        ?: true,
+
+                signature =
+                    "fetchRemoteUuids(" +
+                        "BluetoothDevice, int, AttributionSource" +
+                        ")"
+            )
+        }
+
+        /*
+         * --------------------------------------------------------
+         * RESULT RECEIVER FORM
+         * --------------------------------------------------------
          */
 
         val receiverMethod =
@@ -1080,26 +1036,17 @@ object LeAudioCacheRefresher {
                 receiver
             )
 
-            /*
-             * The Binder method itself is oneway/void.
-             *
-             * Android places the Boolean result inside the
-             * SynchronousResultReceiver.
-             */
-
-            val receiverAnswer =
+            val result =
                 awaitReceiverBoolean(
                     receiver
                 )
 
             return FetchCallResult(
                 accepted =
-                    receiverAnswer
-                        ?: true,
+                    result ?: true,
 
                 signature =
-                    receiverMethod.name +
-                        "(" +
+                    "fetchRemoteUuids(" +
                         "BluetoothDevice, int, " +
                         "AttributionSource, " +
                         "SynchronousResultReceiver" +
@@ -1107,111 +1054,36 @@ object LeAudioCacheRefresher {
             )
         }
 
-        /*
-         * --------------------------------------------------------
-         * DIRECT BOOLEAN FORM
-         * --------------------------------------------------------
-         *
-         * Some Android/Samsung Bluetooth builds expose:
-         *
-         * fetchRemoteUuids(
-         *     BluetoothDevice,
-         *     int,
-         *     AttributionSource
-         * ) -> boolean
-         */
-
-        val directMethod =
-            methods.firstOrNull { method ->
-
-                val types =
-                    method.parameterTypes
-
-                types.size == 3 &&
-
-                    types[0] ==
-                        BluetoothDevice::class.java &&
-
-                    types[1] ==
-                        Int::class.javaPrimitiveType &&
-
-                    types[2].name ==
-                        "android.content.AttributionSource"
-            }
-
-        if (
-            directMethod !=
-            null
-        ) {
-
-            directMethod.isAccessible =
-                true
-
-            val response =
-                directMethod.invoke(
-                    service,
-                    device,
-                    BluetoothDevice.TRANSPORT_LE,
-                    attributionSource
-                )
-
-            val accepted =
-                response as? Boolean
-                    ?: true
-
-            return FetchCallResult(
-                accepted =
-                    accepted,
-
-                signature =
-                    directMethod.name +
-                        "(" +
-                        "BluetoothDevice, int, " +
-                        "AttributionSource" +
-                        ")"
-            )
-        }
-
-        /*
-         * --------------------------------------------------------
-         * NO SUPPORTED SIGNATURE
-         * --------------------------------------------------------
-         */
-
         val signatures =
-            if (
-                methods.isEmpty()
-            ) {
+            if (methods.isEmpty()) {
 
                 "NONE"
 
             } else {
 
-                methods
-                    .joinToString(
-                        separator = "\n"
-                    ) { method ->
+                methods.joinToString(
+                    separator = "\n"
+                ) { method ->
 
-                        method.name +
-                            "(" +
-                            method.parameterTypes
-                                .joinToString(
-                                    separator = ", "
-                                ) {
-
-                                    it.simpleName
-                                } +
-                            ") -> " +
-                            method.returnType.simpleName
-                    }
+                    method.name +
+                        "(" +
+                        method.parameterTypes
+                            .joinToString(
+                                ", "
+                            ) {
+                                it.simpleName
+                            } +
+                        ") -> " +
+                        method.returnType.simpleName
+                }
             }
 
         throw NoSuchMethodException(
             """
-            No supported transport-specific
-            fetchRemoteUuids method was found.
+            No supported fetchRemoteUuids
+            method found.
 
-            Methods exposed by this Samsung build:
+            Samsung methods:
 
             $signatures
             """.trimIndent()
@@ -1220,7 +1092,7 @@ object LeAudioCacheRefresher {
 
     /*
      * ============================================================
-     * CREATE SynchronousResultReceiver
+     * SYNCHRONOUS RESULT RECEIVER
      * ============================================================
      */
 
@@ -1232,13 +1104,7 @@ object LeAudioCacheRefresher {
                 "com.android.modules.utils.SynchronousResultReceiver"
             )
 
-        /*
-         * Current Android uses:
-         *
-         * SynchronousResultReceiver.get()
-         */
-
-        val getMethod =
+        val method =
             receiverClass
                 .methods
                 .firstOrNull {
@@ -1253,10 +1119,10 @@ object LeAudioCacheRefresher {
                     "SynchronousResultReceiver.get()"
                 )
 
-        getMethod.isAccessible =
+        method.isAccessible =
             true
 
-        return getMethod.invoke(
+        return method.invoke(
             null
         )
             ?: throw IllegalStateException(
@@ -1264,19 +1130,13 @@ object LeAudioCacheRefresher {
             )
     }
 
-    /*
-     * ============================================================
-     * WAIT FOR RECEIVER BOOLEAN
-     * ============================================================
-     */
-
     private fun awaitReceiverBoolean(
         receiver: Any
     ): Boolean? {
 
         return try {
 
-            val awaitMethod =
+            val await =
                 receiver
                     .javaClass
                     .methods
@@ -1290,27 +1150,26 @@ object LeAudioCacheRefresher {
                     }
                     ?: return null
 
-            awaitMethod.isAccessible =
+            await.isAccessible =
                 true
 
-            val parameterType =
-                awaitMethod
-                    .parameterTypes[0]
+            val type =
+                await.parameterTypes[0]
 
-            val timeoutArgument: Any =
+            val argument: Any =
                 when {
 
-                    parameterType ==
+                    type ==
                         Duration::class.java ->
 
                         Duration.ofSeconds(
                             RECEIVER_WAIT_SECONDS
                         )
 
-                    parameterType ==
+                    type ==
                         Long::class.javaPrimitiveType ||
 
-                    parameterType ==
+                    type ==
                         java.lang.Long::class.java ->
 
                         RECEIVER_WAIT_SECONDS *
@@ -1321,15 +1180,15 @@ object LeAudioCacheRefresher {
                         return null
                 }
 
-            val resultObject =
-                awaitMethod.invoke(
+            val result =
+                await.invoke(
                     receiver,
-                    timeoutArgument
+                    argument
                 )
                     ?: return null
 
-            val getValueMethod =
-                resultObject
+            val getValue =
+                result
                     .javaClass
                     .methods
                     .firstOrNull {
@@ -1342,11 +1201,11 @@ object LeAudioCacheRefresher {
                     }
                     ?: return null
 
-            getValueMethod.isAccessible =
+            getValue.isAccessible =
                 true
 
-            getValueMethod.invoke(
-                resultObject,
+            getValue.invoke(
+                result,
                 false
             ) as? Boolean
 
@@ -1354,25 +1213,17 @@ object LeAudioCacheRefresher {
             e: InvocationTargetException
         ) {
 
-            val actual =
+            throw (
                 e.targetException
                     ?: e
-
-            throw actual
+                )
 
         } catch (e: Throwable) {
 
             Logger.w(
-                "Could not read SynchronousResultReceiver result: " +
+                "Receiver result unavailable: " +
                     "${e.javaClass.simpleName}: ${e.message}"
             )
-
-            /*
-             * The Binder transaction was still sent.
-             *
-             * Polling the UUID cache below determines whether
-             * it actually succeeded.
-             */
 
             null
         }
@@ -1380,7 +1231,7 @@ object LeAudioCacheRefresher {
 
     /*
      * ============================================================
-     * READ CACHED UUIDS
+     * CACHE HELPERS
      * ============================================================
      */
 
@@ -1408,21 +1259,15 @@ object LeAudioCacheRefresher {
         }
     }
 
-    /*
-     * ============================================================
-     * UUID CHECK
-     * ============================================================
-     */
-
     private fun hasUuid(
         uuids: List<String>,
-        target: String
+        uuid: String
     ): Boolean {
 
         return uuids.any {
 
             it.equals(
-                target,
+                uuid,
                 ignoreCase = true
             )
         }
@@ -1430,7 +1275,7 @@ object LeAudioCacheRefresher {
 
     /*
      * ============================================================
-     * FIND PAIRED BUDS
+     * FIND BUDS
      * ============================================================
      */
 
@@ -1442,20 +1287,13 @@ object LeAudioCacheRefresher {
         val wanted =
             preferredName.trim()
 
-        /*
-         * Exact alias.
-         */
-
         devices
             .firstOrNull { device ->
 
                 val alias =
                     try {
-
                         device.alias
-
                     } catch (_: Throwable) {
-
                         null
                     }
 
@@ -1469,20 +1307,13 @@ object LeAudioCacheRefresher {
                 return it
             }
 
-        /*
-         * Exact Bluetooth name.
-         */
-
         devices
             .firstOrNull { device ->
 
                 val name =
                     try {
-
                         device.name
-
                     } catch (_: Throwable) {
-
                         null
                     }
 
@@ -1495,10 +1326,6 @@ object LeAudioCacheRefresher {
 
                 return it
             }
-
-        /*
-         * Buds4 Pro.
-         */
 
         val buds4 =
             devices.filter {
@@ -1517,10 +1344,6 @@ object LeAudioCacheRefresher {
 
             return buds4.first()
         }
-
-        /*
-         * Generic Buds Pro.
-         */
 
         val budsPro =
             devices.filter {
@@ -1549,33 +1372,21 @@ object LeAudioCacheRefresher {
         return null
     }
 
-    /*
-     * ============================================================
-     * DEVICE NAME
-     * ============================================================
-     */
-
     private fun safeDeviceLabel(
         device: BluetoothDevice
     ): String {
 
         val alias =
             try {
-
                 device.alias
-
             } catch (_: Throwable) {
-
                 null
             }
 
         val name =
             try {
-
                 device.name
-
             } catch (_: Throwable) {
-
                 null
             }
 
@@ -1591,12 +1402,6 @@ object LeAudioCacheRefresher {
                 "Unnamed Bluetooth Device"
         }
     }
-
-    /*
-     * ============================================================
-     * MASK ADDRESS
-     * ============================================================
-     */
 
     private fun maskAddress(
         address: String
@@ -1616,58 +1421,22 @@ object LeAudioCacheRefresher {
             )
     }
 
-    /*
-     * ============================================================
-     * UUID LIST TEXT
-     * ============================================================
-     */
-
-    private fun uuidListText(
-        uuids: List<String>
-    ): String {
-
-        return if (
-            uuids.isEmpty()
-        ) {
-
-            "NONE"
-
-        } else {
-
-            uuids.joinToString(
-                separator = "\n"
-            )
-        }
-    }
-
-    /*
-     * ============================================================
-     * UNWRAP REFLECTION ERROR
-     * ============================================================
-     */
-
     private fun unwrap(
-        error: Throwable
+        throwable: Throwable
     ): Throwable {
 
         return if (
-            error is InvocationTargetException
+            throwable is InvocationTargetException
         ) {
 
-            error.targetException
-                ?: error
+            throwable.targetException
+                ?: throwable
 
         } else {
 
-            error
+            throwable
         }
     }
-
-    /*
-     * ============================================================
-     * YES / NO
-     * ============================================================
-     */
 
     private fun yesNo(
         value: Boolean
@@ -1679,12 +1448,6 @@ object LeAudioCacheRefresher {
             "NO"
         }
     }
-
-    /*
-     * ============================================================
-     * FAILURE
-     * ============================================================
-     */
 
     private fun failure(
         details: String
@@ -1717,12 +1480,6 @@ object LeAudioCacheRefresher {
                 """.trimIndent()
         )
     }
-
-    /*
-     * ============================================================
-     * INTERNAL FETCH RESULT
-     * ============================================================
-     */
 
     private data class FetchCallResult(
         val accepted: Boolean,
