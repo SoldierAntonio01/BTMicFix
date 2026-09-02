@@ -1,7 +1,8 @@
 package com.btmicfix.automation
 
-import android.app.Notification
-import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.media.AudioRecordingConfiguration
+import android.media.MediaRecorder
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.btmicfix.audio.AudioRoutingManager
@@ -12,37 +13,59 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Automatically controls BTMicFix from Voice Access.
+ * BTMicFix Voice Access automation.
  *
- * Voice Access LISTENING:
+ * NEW DESIGN:
  *
- *      Buds LE Audio mic route ON
+ * We DO NOT try to guess Voice Access listening state
+ * from notification words such as:
  *
- * Voice Access PAUSED / STOPPED:
+ * "Pause"
+ * "Start listening"
+ * "Touch to start"
  *
- *      communication route OFF
- *      AudioManager returns to normal mode
+ * Voice Access 17+ changed how listening mode is controlled.
+ *
+ * Instead:
+ *
+ * 1. NotificationListener confirms Voice Access is present.
+ *
+ * 2. AudioManager.AudioRecordingCallback tells us when
+ *    voice recording ACTUALLY starts/stops.
+ *
+ * 3. Recording starts:
+ *
+ *        BLE Buds microphone route ON
+ *
+ * 4. Recording stops:
+ *
+ *        BLE communication route OFF
+ *
  *
  * IMPORTANT:
  *
- * The LE Audio PROFILE itself is deliberately left connected
- * when Voice Access pauses.
+ * The actual LE Audio PROFILE remains connected.
  *
- * That avoids doing a full HFP/A2DP <-> LE Audio profile handover
- * every time Voice Access starts/stops, which would likely bring
- * back the 2-3 second audio interruptions.
+ * We are only switching the communication route.
  *
- * This service is event-driven.
- *
- * NO repeating watchdog.
- * NO notification polling loop.
+ * This avoids repeatedly tearing down and recreating LE Audio
+ * and should preserve the smooth audio setup we already achieved.
  */
 class VoiceAccessMonitorService :
     NotificationListenerService() {
 
     /*
      * ============================================================
-     * AUDIO ROUTING
+     * AUDIO MANAGER
+     * ============================================================
+     */
+
+    private lateinit var audioManager:
+        AudioManager
+
+    /*
+     * ============================================================
+     * BTMICFIX ROUTING
      * ============================================================
      */
 
@@ -51,12 +74,16 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * BACKGROUND WORK
+     * WORKER
      * ============================================================
      */
 
     private val worker =
         Executors.newSingleThreadExecutor()
+
+    /*
+     * Prevent multiple connection attempts from running together.
+     */
 
     private val activationRunning =
         AtomicBoolean(
@@ -65,17 +92,50 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * VOICE ACCESS STATE
+     * STATE
      * ============================================================
      */
 
     @Volatile
-    private var voiceAccessListening =
+    private var voiceAccessNotificationPresent =
         false
 
-    private var lastDetectedState:
-        Boolean? =
-        null
+    @Volatile
+    private var voiceRecordingActive =
+        false
+
+    @Volatile
+    private var routeRequested =
+        false
+
+    /*
+     * ============================================================
+     * AUDIO RECORDING CALLBACK
+     * ============================================================
+     *
+     * Android tells us whenever microphone recording state changes.
+     *
+     * NO POLLING.
+     */
+
+    private val recordingCallback =
+        object :
+            AudioManager.AudioRecordingCallback() {
+
+            override fun onRecordingConfigChanged(
+                configs:
+                    List<AudioRecordingConfiguration>
+            ) {
+
+                super.onRecordingConfigChanged(
+                    configs
+                )
+
+                handleRecordingConfigurations(
+                    configs
+                )
+            }
+        }
 
     /*
      * ============================================================
@@ -87,22 +147,56 @@ class VoiceAccessMonitorService :
 
         super.onCreate()
 
+        Logger.i(
+            "VoiceAccessMonitorService created"
+        )
+
+        audioManager =
+            getSystemService(
+                AudioManager::class.java
+            )
+
         routingManager =
             AudioRoutingManager(
                 applicationContext
             )
 
+        /*
+         * The routing manager itself remains
+         * event-driven.
+         */
+
         routingManager
             .startMonitoring()
 
-        Logger.i(
-            "Voice Access automation service created"
-        )
+        /*
+         * Listen for actual Android recording changes.
+         */
+
+        try {
+
+            audioManager
+                .registerAudioRecordingCallback(
+                    recordingCallback,
+                    null
+                )
+
+            Logger.i(
+                "Audio recording callback registered"
+            )
+
+        } catch (e: Throwable) {
+
+            Logger.e(
+                "Could not register recording callback",
+                e
+            )
+        }
     }
 
     /*
      * ============================================================
-     * LISTENER CONNECTED
+     * NOTIFICATION LISTENER READY
      * ============================================================
      */
 
@@ -114,12 +208,21 @@ class VoiceAccessMonitorService :
             "Notification listener connected"
         )
 
-        refreshVoiceAccessState()
+        refreshVoiceAccessPresence()
+
+        /*
+         * Read the current recording state immediately.
+         *
+         * This is important if Voice Access was already listening
+         * before BTMicFix's service connected.
+         */
+
+        refreshCurrentRecordingState()
     }
 
     /*
      * ============================================================
-     * NOTIFICATION POSTED / UPDATED
+     * VOICE ACCESS NOTIFICATION POSTED
      * ============================================================
      */
 
@@ -132,13 +235,19 @@ class VoiceAccessMonitorService :
             VOICE_ACCESS_PACKAGE
         ) {
 
-            refreshVoiceAccessState()
+            Logger.i(
+                "Voice Access notification posted/updated"
+            )
+
+            refreshVoiceAccessPresence()
+
+            refreshCurrentRecordingState()
         }
     }
 
     /*
      * ============================================================
-     * NOTIFICATION REMOVED
+     * VOICE ACCESS NOTIFICATION REMOVED
      * ============================================================
      */
 
@@ -151,315 +260,319 @@ class VoiceAccessMonitorService :
             VOICE_ACCESS_PACKAGE
         ) {
 
-            refreshVoiceAccessState()
+            Logger.i(
+                "Voice Access notification removed"
+            )
+
+            refreshVoiceAccessPresence()
+
+            refreshCurrentRecordingState()
         }
     }
 
     /*
      * ============================================================
-     * DETECT CURRENT VOICE ACCESS STATE
+     * CHECK WHETHER VOICE ACCESS IS PRESENT
      * ============================================================
+     *
+     * We intentionally DO NOT parse the notification wording.
+     *
+     * We only care whether Voice Access itself currently has
+     * an active notification.
      */
 
-    private fun refreshVoiceAccessState() {
+    private fun refreshVoiceAccessPresence() {
 
-        val voiceNotifications =
+        val present =
             try {
 
                 activeNotifications
-                    ?.filter {
+                    ?.any {
 
                         it.packageName ==
                             VOICE_ACCESS_PACKAGE
                     }
-                    ?: emptyList()
+                    ?: false
 
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+
+                Logger.w(
+                    "Could not read active notifications: " +
+                        "${e.message}"
+                )
+
+                false
+            }
+
+        voiceAccessNotificationPresent =
+            present
+
+        Logger.i(
+            "Voice Access notification present = $present"
+        )
+
+        /*
+         * If Voice Access disappeared completely,
+         * release our communication route.
+         */
+
+        if (!present) {
+
+            requestRouteOff()
+        }
+    }
+
+    /*
+     * ============================================================
+     * GET CURRENT RECORDINGS
+     * ============================================================
+     */
+
+    private fun refreshCurrentRecordingState() {
+
+        val configs =
+            try {
+
+                audioManager
+                    .activeRecordingConfigurations
+
+            } catch (e: Throwable) {
+
+                Logger.w(
+                    "Could not read active recording configurations: " +
+                        "${e.message}"
+                )
 
                 emptyList()
             }
 
+        handleRecordingConfigurations(
+            configs
+        )
+    }
+
+    /*
+     * ============================================================
+     * HANDLE RECORDING STATE
+     * ============================================================
+     */
+
+    private fun handleRecordingConfigurations(
+        configs:
+            List<AudioRecordingConfiguration>
+    ) {
+
         /*
-         * No Voice Access notification:
+         * We're interested in active voice/microphone capture.
          *
-         * Treat Voice Access as not listening.
+         * Voice Access generally uses a voice-recognition capture
+         * path, but Samsung/Google can expose slightly different
+         * sources depending on Speech Services and Android version.
          */
 
+        val activeVoiceRecording =
+            configs.any {
+                    config ->
+
+                isUsefulVoiceRecording(
+                    config
+                )
+            }
+
         if (
-            voiceNotifications.isEmpty()
+            voiceRecordingActive ==
+            activeVoiceRecording
         ) {
 
-            applyVoiceAccessState(
-                false
-            )
+            /*
+             * Nothing changed.
+             */
 
             return
         }
 
+        voiceRecordingActive =
+            activeVoiceRecording
+
+        Logger.i(
+            "Voice recording active = " +
+                activeVoiceRecording
+        )
+
+        evaluateAutomationState()
+    }
+
+    /*
+     * ============================================================
+     * IS THIS A VOICE RECORDING?
+     * ============================================================
+     */
+
+    private fun isUsefulVoiceRecording(
+        config:
+            AudioRecordingConfiguration
+    ): Boolean {
+
         /*
-         * Inspect each Voice Access notification.
+         * Ignore clients Android says are silenced.
          */
 
-        var detected:
-            Boolean? =
-            null
+        val silenced =
+            try {
 
-        for (
-            sbn in voiceNotifications
-        ) {
+                config.isClientSilenced
 
-            val notification =
-                sbn.notification
+            } catch (_: Throwable) {
 
-            val actionTexts =
-                notification
-                    .actions
-                    ?.mapNotNull {
-
-                        it.title
-                            ?.toString()
-                            ?.trim()
-                            ?.lowercase()
-                    }
-                    ?: emptyList()
-
-            /*
-             * ----------------------------------------------------
-             * ACTION BUTTONS
-             * ----------------------------------------------------
-             *
-             * If Voice Access offers PAUSE, it is currently
-             * listening.
-             *
-             * If it offers START / RESUME, it is currently paused.
-             */
-
-            if (
-                actionTexts.any {
-
-                    it ==
-                        "start" ||
-
-                    it.contains(
-                        "start listening"
-                    ) ||
-
-                    it.contains(
-                        "resume"
-                    )
-                }
-            ) {
-
-                detected =
-                    false
-
-                break
+                false
             }
 
-            if (
-                actionTexts.any {
+        if (silenced) {
 
-                    it ==
-                        "pause" ||
-
-                    it.contains(
-                        "stop listening"
-                    )
-                }
-            ) {
-
-                detected =
-                    true
-
-                break
-            }
-
-            /*
-             * ----------------------------------------------------
-             * NOTIFICATION TEXT
-             * ----------------------------------------------------
-             */
-
-            val extras =
-                notification.extras
-
-            val title =
-                extras
-                    .getCharSequence(
-                        Notification.EXTRA_TITLE
-                    )
-                    ?.toString()
-                    .orEmpty()
-
-            val text =
-                extras
-                    .getCharSequence(
-                        Notification.EXTRA_TEXT
-                    )
-                    ?.toString()
-                    .orEmpty()
-
-            val bigText =
-                extras
-                    .getCharSequence(
-                        Notification.EXTRA_BIG_TEXT
-                    )
-                    ?.toString()
-                    .orEmpty()
-
-            val subText =
-                extras
-                    .getCharSequence(
-                        Notification.EXTRA_SUB_TEXT
-                    )
-                    ?.toString()
-                    .orEmpty()
-
-            val combined =
-                "$title $text $bigText $subText"
-                    .lowercase()
-
-            /*
-             * Paused states FIRST so "not listening"
-             * cannot accidentally match "listening".
-             */
-
-            if (
-                combined.contains(
-                    "tap to start"
-                ) ||
-
-                combined.contains(
-                    "touch to start"
-                ) ||
-
-                combined.contains(
-                    "start listening"
-                ) ||
-
-                combined.contains(
-                    "not listening"
-                ) ||
-
-                combined.contains(
-                    "paused"
-                )
-            ) {
-
-                detected =
-                    false
-
-                break
-            }
-
-            if (
-                combined.contains(
-                    "tap to pause"
-                ) ||
-
-                combined.contains(
-                    "touch to pause"
-                ) ||
-
-                combined.contains(
-                    "stop listening"
-                ) ||
-
-                combined.contains(
-                    "is listening"
-                )
-            ) {
-
-                detected =
-                    true
-
-                break
-            }
+            return false
         }
 
+        val source =
+            try {
+
+                config.clientAudioSource
+
+            } catch (_: Throwable) {
+
+                return true
+            }
+
         /*
-         * If Samsung/Google changes the wording and we cannot
-         * confidently determine the state, preserve the current
-         * state rather than randomly switching the audio route.
+         * These cover Voice Access / speech recognition
+         * while avoiding obvious non-voice recording paths.
          */
 
-        if (
-            detected !=
-            null
-        ) {
+        return when (source) {
 
-            applyVoiceAccessState(
-                detected
-            )
+            MediaRecorder.AudioSource.VOICE_RECOGNITION ->
+                true
+
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION ->
+                true
+
+            MediaRecorder.AudioSource.MIC ->
+                true
+
+            MediaRecorder.AudioSource.DEFAULT ->
+                true
+
+            MediaRecorder.AudioSource.UNPROCESSED ->
+                true
+
+            else ->
+                false
         }
     }
 
     /*
      * ============================================================
-     * APPLY STATE
+     * AUTOMATION DECISION
      * ============================================================
      */
 
-    private fun applyVoiceAccessState(
-        listening: Boolean
-    ) {
+    private fun evaluateAutomationState() {
 
-        if (
-            lastDetectedState ==
-            listening
-        ) {
+        /*
+         * VOICE ACCESS PRESENT
+         * +
+         * MICROPHONE ACTUALLY RECORDING
+         *
+         * =
+         *
+         * BUDS MIC ROUTE ON
+         */
 
-            return
-        }
+        val shouldRoute =
+            voiceAccessNotificationPresent &&
+                voiceRecordingActive
 
-        lastDetectedState =
-            listening
+        Logger.i(
+            "Voice Access automation decision: " +
+                "notification=$voiceAccessNotificationPresent, " +
+                "recording=$voiceRecordingActive, " +
+                "route=$shouldRoute"
+        )
 
-        voiceAccessListening =
-            listening
+        if (shouldRoute) {
 
-        if (listening) {
-
-            Logger.i(
-                "Voice Access LISTENING -> Buds mic ON"
-            )
-
-            requestActivation()
+            requestRouteOn()
 
         } else {
 
-            Logger.i(
-                "Voice Access PAUSED -> Buds mic OFF"
-            )
-
-            /*
-             * Release immediately.
-             *
-             * Do not wait behind Bluetooth connection work.
-             */
-
-            try {
-
-                routingManager
-                    .clearRouting()
-
-            } catch (e: Throwable) {
-
-                Logger.e(
-                    "Could not release Voice Access route",
-                    e
-                )
-            }
+            requestRouteOff()
         }
     }
 
     /*
      * ============================================================
-     * START BACKGROUND ACTIVATION
+     * ROUTE ON
      * ============================================================
      */
 
-    private fun requestActivation() {
+    private fun requestRouteOn() {
+
+        if (routeRequested) {
+
+            return
+        }
+
+        routeRequested =
+            true
+
+        Logger.i(
+            "Voice Access listening -> requesting Buds BLE mic"
+        )
+
+        /*
+         * ========================================================
+         * FASTEST PATH
+         * ========================================================
+         *
+         * Your screenshot already shows:
+         *
+         * Antonio's Buds4 Pro
+         * BLE Headset / LE Audio
+         *
+         * If TYPE_BLE_HEADSET already exists, we do NOT need
+         * Shizuku/cache/profile work again.
+         */
+
+        val existingBle =
+            routingManager
+                .findFirstBluetoothCommunicationDevice()
+
+        if (
+            existingBle !=
+            null
+        ) {
+
+            Logger.i(
+                "BLE headset already available -> fast routing"
+            )
+
+            val result =
+                routingManager
+                    .routeToBluetooth(
+                        existingBle
+                    )
+
+            Logger.i(
+                "Fast Voice Access route result: $result"
+            )
+
+            return
+        }
+
+        /*
+         * BLE endpoint doesn't currently exist.
+         *
+         * Run the slower setup in the background.
+         */
 
         if (
             !activationRunning
@@ -476,64 +589,44 @@ class VoiceAccessMonitorService :
 
             try {
 
-                activateBudsMic()
+                activateLeAudioSlowPath()
 
             } finally {
 
-                activationRunning.set(
-                    false
-                )
+                activationRunning
+                    .set(
+                        false
+                    )
             }
         }
     }
 
     /*
      * ============================================================
-     * ACTIVATE BUDS MIC
+     * SLOW LE AUDIO ACTIVATION
      * ============================================================
      */
 
-    private fun activateBudsMic() {
-
-        if (!voiceAccessListening) {
-
-            return
-        }
+    private fun activateLeAudioSlowPath() {
 
         /*
-         * ========================================================
-         * FAST PATH
-         * ========================================================
-         *
-         * If TYPE_BLE_HEADSET already exists, do not touch
-         * Shizuku, GATT, cache, or LE profile state.
-         *
-         * Just route it.
+         * User may have stopped Voice Access while
+         * this was waiting.
          */
 
-        val existingBle =
-            routingManager
-                .findFirstBluetoothCommunicationDevice()
-
         if (
-            existingBle !=
-            null
+            !shouldStillBeActive()
         ) {
 
-            if (voiceAccessListening) {
-
-                routingManager
-                    .routeToBluetooth(
-                        existingBle
-                    )
-            }
+            routeRequested =
+                false
 
             return
         }
 
         /*
          * ========================================================
-         * FIND BUDS NAME
+         * FIND BUDS
          * ========================================================
          */
 
@@ -546,24 +639,12 @@ class VoiceAccessMonitorService :
             devices
                 .firstOrNull {
 
-                    it.deviceInfo.type ==
-                        AudioDeviceInfo.TYPE_BLE_HEADSET
+                    it.name.contains(
+                        "Buds",
+                        ignoreCase =
+                            true
+                    )
                 }
-                ?: devices
-                    .firstOrNull {
-
-                        it.deviceInfo.type ==
-                            AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                    }
-                ?: devices
-                    .firstOrNull {
-
-                        it.name.contains(
-                            "Buds",
-                            ignoreCase =
-                                true
-                        )
-                    }
 
         if (
             buds ==
@@ -571,8 +652,11 @@ class VoiceAccessMonitorService :
         ) {
 
             Logger.w(
-                "Voice Access automation: Buds not found"
+                "Voice Access automation could not find Buds"
             )
+
+            routeRequested =
+                false
 
             return
         }
@@ -582,9 +666,13 @@ class VoiceAccessMonitorService :
 
         /*
          * ========================================================
-         * CACHE
+         * CACHE CHECK
          * ========================================================
          */
+
+        Logger.i(
+            "Checking LE Audio cache"
+        )
 
         val refresh =
             LeAudioCacheRefresher
@@ -597,8 +685,11 @@ class VoiceAccessMonitorService :
                 )
 
         if (
-            !voiceAccessListening
+            !shouldStillBeActive()
         ) {
+
+            routeRequested =
+                false
 
             return
         }
@@ -609,19 +700,26 @@ class VoiceAccessMonitorService :
         ) {
 
             Logger.w(
-                "Voice Access automation: LE cache not ready"
+                "LE Audio cache not ready"
             )
+
+            routeRequested =
+                false
 
             return
         }
 
         /*
          * ========================================================
-         * LE AUDIO PROFILE
+         * LE AUDIO CONNECTION
          * ========================================================
          */
 
-        val connect =
+        Logger.i(
+            "Connecting LE Audio profile"
+        )
+
+        val connectResult =
             LeAudioShizukuBridge
                 .forceLeAudio(
                     context =
@@ -632,31 +730,38 @@ class VoiceAccessMonitorService :
                 )
 
         if (
-            !voiceAccessListening
+            !shouldStillBeActive()
         ) {
+
+            routeRequested =
+                false
 
             return
         }
 
         val connected =
-            connect.contains(
+            connectResult.contains(
                 "ACCEPTED - LE AUDIO CONNECTED"
             ) ||
-                connect.contains(
+                connectResult.contains(
                     "ACCEPTED - ALREADY CONNECTED"
                 )
 
         if (!connected) {
 
             Logger.w(
-                "Voice Access automation: LE Audio did not connect"
+                "LE Audio connection did not complete"
             )
+
+            routeRequested =
+                false
 
             return
         }
 
         /*
-         * Small settling delay.
+         * Give Android a short amount of time to expose
+         * TYPE_BLE_HEADSET.
          */
 
         try {
@@ -665,47 +770,104 @@ class VoiceAccessMonitorService :
                 500L
             )
 
-        } catch (_: InterruptedException) {
+        } catch (
+            _: InterruptedException
+        ) {
         }
 
         if (
-            !voiceAccessListening
+            !shouldStillBeActive()
         ) {
+
+            routeRequested =
+                false
 
             return
         }
 
         /*
          * ========================================================
-         * FINAL ROUTE
+         * FINAL BLE ROUTE
          * ========================================================
          */
 
-        routingManager
-            .routeToFirstAvailableBluetooth()
+        val result =
+            routingManager
+                .routeToFirstAvailableBluetooth()
+
+        Logger.i(
+            "Voice Access BLE route result: $result"
+        )
     }
 
     /*
      * ============================================================
-     * DISCONNECTED
+     * ROUTE OFF
      * ============================================================
      */
 
-    override fun onListenerDisconnected() {
+    private fun requestRouteOff() {
 
-        voiceAccessListening =
+        if (!routeRequested) {
+
+            return
+        }
+
+        routeRequested =
             false
 
-        lastDetectedState =
-            false
+        Logger.i(
+            "Voice Access stopped recording -> " +
+                "releasing BLE communication route"
+        )
 
         try {
 
             routingManager
                 .clearRouting()
 
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
+
+            Logger.e(
+                "Could not release Voice Access route",
+                e
+            )
         }
+    }
+
+    /*
+     * ============================================================
+     * SHOULD ACTIVATION CONTINUE?
+     * ============================================================
+     */
+
+    private fun shouldStillBeActive():
+        Boolean {
+
+        return routeRequested &&
+            voiceAccessNotificationPresent &&
+            voiceRecordingActive
+    }
+
+    /*
+     * ============================================================
+     * LISTENER DISCONNECTED
+     * ============================================================
+     */
+
+    override fun onListenerDisconnected() {
+
+        Logger.w(
+            "Notification listener disconnected"
+        )
+
+        voiceAccessNotificationPresent =
+            false
+
+        voiceRecordingActive =
+            false
+
+        requestRouteOff()
 
         super.onListenerDisconnected()
     }
@@ -718,13 +880,24 @@ class VoiceAccessMonitorService :
 
     override fun onDestroy() {
 
-        voiceAccessListening =
+        Logger.i(
+            "Voice Access automation destroyed"
+        )
+
+        voiceAccessNotificationPresent =
             false
+
+        voiceRecordingActive =
+            false
+
+        requestRouteOff()
 
         try {
 
-            routingManager
-                .clearRouting()
+            audioManager
+                .unregisterAudioRecordingCallback(
+                    recordingCallback
+                )
 
         } catch (_: Throwable) {
         }
@@ -742,7 +915,17 @@ class VoiceAccessMonitorService :
         super.onDestroy()
     }
 
+    /*
+     * ============================================================
+     * CONSTANTS
+     * ============================================================
+     */
+
     companion object {
+
+        /*
+         * Confirmed Google Play package name for Voice Access.
+         */
 
         private const val
             VOICE_ACCESS_PACKAGE =
