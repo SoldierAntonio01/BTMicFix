@@ -20,46 +20,57 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Voice Access -> BTMicFix automation.
+ * BTMicFix Voice Access automation.
  *
  *
- * NORMAL STATE
+ * DESIRED BEHAVIOR
+ * =================
  *
  * Voice Access stopped:
  *
- * BTMicFix = Idle
- * communication route = OFF
+ *      BTMicFix = Idle
+ *      BLE communication route = OFF
  *
  *
- * VOICE ACCESS LISTENING
+ * Voice Access starts listening:
  *
- * Android AppOps says:
+ *      Android RECORD_AUDIO AppOp = ACTIVE
  *
- * RECORD_AUDIO = ACTIVE
+ *              ↓
  *
- *      ↓
+ *      Shizuku AppOps watcher callback
  *
- * BTMicFix routes TYPE_BLE_HEADSET
+ *              ↓
+ *
+ *      BTMicFix routes TYPE_BLE_HEADSET
  *
  *
- * VOICE ACCESS PAUSED
+ * Voice Access stops listening:
  *
- * RECORD_AUDIO = INACTIVE
+ *      RECORD_AUDIO = INACTIVE
  *
- *      ↓
+ *              ↓
  *
- * BTMicFix releases communication route
+ *      short debounce
+ *
+ *              ↓
+ *
+ *      clearCommunicationDevice()
+ *
+ *              ↓
+ *
+ *      BTMicFix = Idle
  *
  *
  * IMPORTANT:
  *
- * This service DOES NOT detect Voice Access by notification text.
+ * This does NOT continuously poll Voice Access.
  *
- * NotificationListenerService is used only as a lightweight
- * Android-managed lifecycle host.
+ * Voice Access state comes from the privileged
+ * VoiceAccessAppOpsService running through Shizuku.
  *
- * Actual detection occurs inside our privileged Shizuku
- * AppOps watcher.
+ * NotificationListenerService is only being used as an
+ * Android-managed lifecycle host for the background automation.
  */
 class VoiceAccessMonitorService :
     NotificationListenerService() {
@@ -122,15 +133,13 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * OFF DEBOUNCE
+     * DELAYED ROUTE OFF
      * ============================================================
      *
-     * If Voice Access briefly releases RECORD_AUDIO internally
-     * between recognition cycles, don't immediately tear down
-     * the route.
+     * Voice recognition can occasionally produce tiny internal
+     * RECORD_AUDIO gaps.
      *
-     * A real "Stop listening" state remains inactive and this
-     * releases the route after 1.2 seconds.
+     * We don't want one tiny gap to shut the Buds mic off.
      */
 
     private val delayedRouteOff =
@@ -148,6 +157,13 @@ class VoiceAccessMonitorService :
      * ============================================================
      * SHIZUKU USER SERVICE ARGS
      * ============================================================
+     *
+     * IMPORTANT:
+     *
+     * Use the package-name/class-name ComponentName constructor.
+     *
+     * This follows the same pattern used by our other
+     * Shizuku UserService.
      */
 
     private val watcherArgs:
@@ -156,18 +172,12 @@ class VoiceAccessMonitorService :
 
             Shizuku.UserServiceArgs(
                 ComponentName(
-                    applicationContext,
-                    VoiceAccessAppOpsService::class.java
+                    BuildConfig.APPLICATION_ID,
+                    VoiceAccessAppOpsService::class.java.name
                 )
             )
                 .daemon(
                     false
-                )
-                .tag(
-                    "btmicfix_voice_access_appops"
-                )
-                .version(
-                    WATCHER_SERVICE_VERSION
                 )
                 .processNameSuffix(
                     "voice_access_appops"
@@ -175,11 +185,14 @@ class VoiceAccessMonitorService :
                 .debuggable(
                     BuildConfig.DEBUG
                 )
+                .version(
+                    WATCHER_SERVICE_VERSION
+                )
         }
 
     /*
      * ============================================================
-     * PRIVILEGED CALLBACK
+     * APPOPS CALLBACK FROM SHIZUKU PROCESS
      * ============================================================
      */
 
@@ -192,7 +205,9 @@ class VoiceAccessMonitorService :
             ) {
 
                 /*
-                 * Binder callback may arrive on a Binder thread.
+                 * This callback comes from Binder.
+                 *
+                 * Send state handling onto the main thread.
                  */
 
                 mainHandler.post {
@@ -210,7 +225,7 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * SHIZUKU SERVICE CONNECTION
+     * SHIZUKU USER SERVICE CONNECTION
      * ============================================================
      */
 
@@ -226,9 +241,12 @@ class VoiceAccessMonitorService :
                 watcherBinding =
                     false
 
+                /*
+                 * Validate Binder.
+                 */
+
                 if (
-                    binder ==
-                    null ||
+                    binder == null ||
                     !binder.pingBinder()
                 ) {
 
@@ -236,8 +254,15 @@ class VoiceAccessMonitorService :
                         "Voice Access AppOps watcher returned invalid Binder"
                     )
 
+                    watcher =
+                        null
+
                     return
                 }
+
+                /*
+                 * Convert Binder into generated AIDL interface.
+                 */
 
                 val remote =
                     IVoiceAccessWatcher
@@ -249,12 +274,15 @@ class VoiceAccessMonitorService :
                 watcher =
                     remote
 
+                /*
+                 * Find Google's Voice Access UID.
+                 */
+
                 val voiceAccessUid =
                     findVoiceAccessUid()
 
                 if (
-                    voiceAccessUid <
-                    0
+                    voiceAccessUid < 0
                 ) {
 
                     Logger.w(
@@ -263,6 +291,10 @@ class VoiceAccessMonitorService :
 
                     return
                 }
+
+                /*
+                 * Start watching Voice Access RECORD_AUDIO.
+                 */
 
                 try {
 
@@ -278,20 +310,18 @@ class VoiceAccessMonitorService :
                     )
 
                     /*
-                     * startWatch already sends the initial callback,
-                     * but query again as a safety check.
+                     * startWatch() should already send the initial
+                     * callback, but query once as a safety check.
                      */
 
-                    val active =
+                    val currentlyActive =
                         remote.isTargetActive()
 
                     applyVoiceAccessState(
-                        active
+                        currentlyActive
                     )
 
-                } catch (
-                    e: Throwable
-                ) {
+                } catch (e: Throwable) {
 
                     Logger.e(
                         "Could not start Voice Access AppOps watcher",
@@ -314,6 +344,13 @@ class VoiceAccessMonitorService :
                 watcherBinding =
                     false
 
+                /*
+                 * Fail safe:
+                 *
+                 * If the privileged watcher dies, don't leave the
+                 * Buds communication route permanently active.
+                 */
+
                 applyVoiceAccessState(
                     false
                 )
@@ -322,7 +359,7 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * SHIZUKU BINDER EVENTS
+     * SHIZUKU BINDER RECEIVED
      * ============================================================
      */
 
@@ -335,6 +372,12 @@ class VoiceAccessMonitorService :
 
             bindWatcherIfPossible()
         }
+
+    /*
+     * ============================================================
+     * SHIZUKU BINDER DEAD
+     * ============================================================
+     */
 
     private val shizukuDeadListener =
         Shizuku.OnBinderDeadListener {
@@ -374,32 +417,57 @@ class VoiceAccessMonitorService :
             )
 
         /*
-         * Event-driven device monitoring.
+         * This only watches audio-device changes.
          *
-         * This does NOT turn routing on.
+         * It DOES NOT automatically route the Buds.
          */
 
         routingManager
             .startMonitoring()
 
         /*
-         * Listen for Shizuku becoming available/restarting.
+         * Listen for Shizuku startup/restart.
          */
 
-        Shizuku
-            .addBinderReceivedListenerSticky(
-                shizukuReceivedListener
-            )
+        try {
 
-        Shizuku
-            .addBinderDeadListener(
-                shizukuDeadListener
+            Shizuku
+                .addBinderReceivedListener(
+                    shizukuReceivedListener
+                )
+
+        } catch (e: Throwable) {
+
+            Logger.w(
+                "Could not add Shizuku binder listener: ${e.message}"
             )
+        }
+
+        try {
+
+            Shizuku
+                .addBinderDeadListener(
+                    shizukuDeadListener
+                )
+
+        } catch (e: Throwable) {
+
+            Logger.w(
+                "Could not add Shizuku death listener: ${e.message}"
+            )
+        }
+
+        /*
+         * Shizuku may already be running before this listener
+         * was registered.
+         */
+
+        bindWatcherIfPossible()
     }
 
     /*
      * ============================================================
-     * ANDROID CONNECTS NOTIFICATION LISTENER
+     * NOTIFICATION LISTENER CONNECTED
      * ============================================================
      */
 
@@ -416,19 +484,26 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * BIND PRIVILEGED WATCHER
+     * BIND PRIVILEGED APPOPS WATCHER
      * ============================================================
      */
 
     private fun bindWatcherIfPossible() {
 
+        /*
+         * Already connected.
+         */
+
         if (
-            watcher !=
-            null
+            watcher != null
         ) {
 
             return
         }
+
+        /*
+         * Already trying.
+         */
 
         if (
             watcherBinding
@@ -437,14 +512,16 @@ class VoiceAccessMonitorService :
             return
         }
 
+        /*
+         * Is Shizuku alive?
+         */
+
         val shizukuRunning =
             try {
 
                 Shizuku.pingBinder()
 
-            } catch (
-                _: Throwable
-            ) {
+            } catch (_: Throwable) {
 
                 false
             }
@@ -460,14 +537,16 @@ class VoiceAccessMonitorService :
             return
         }
 
+        /*
+         * Does BTMicFix have Shizuku permission?
+         */
+
         val permission =
             try {
 
                 Shizuku.checkSelfPermission()
 
-            } catch (
-                _: Throwable
-            ) {
+            } catch (_: Throwable) {
 
                 PackageManager.PERMISSION_DENIED
             }
@@ -487,6 +566,10 @@ class VoiceAccessMonitorService :
         watcherBinding =
             true
 
+        /*
+         * Bind the privileged watcher.
+         */
+
         try {
 
             Shizuku.bindUserService(
@@ -494,9 +577,11 @@ class VoiceAccessMonitorService :
                 watcherConnection
             )
 
-        } catch (
-            e: Throwable
-        ) {
+            Logger.i(
+                "Binding Voice Access AppOps watcher"
+            )
+
+        } catch (e: Throwable) {
 
             watcherBinding =
                 false
@@ -530,9 +615,7 @@ class VoiceAccessMonitorService :
                 )
                 .uid
 
-        } catch (
-            e: Throwable
-        ) {
+        } catch (e: Throwable) {
 
             Logger.e(
                 "Voice Access package not found",
@@ -545,7 +628,7 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * APPLY VOICE ACCESS STATE
+     * APPLY VOICE ACCESS APPOPS STATE
      * ============================================================
      */
 
@@ -553,17 +636,26 @@ class VoiceAccessMonitorService :
         active: Boolean
     ) {
 
-        if (
-            active
-        ) {
+        /*
+         * ========================================================
+         * VOICE ACCESS ACTIVE
+         * ========================================================
+         */
+
+        if (active) {
 
             /*
-             * Cancel any pending OFF operation.
+             * Cancel pending OFF.
              */
 
-            mainHandler.removeCallbacks(
-                delayedRouteOff
-            )
+            mainHandler
+                .removeCallbacks(
+                    delayedRouteOff
+                )
+
+            /*
+             * Already active.
+             */
 
             if (
                 voiceAccessActive
@@ -576,44 +668,57 @@ class VoiceAccessMonitorService :
                 true
 
             Logger.i(
-                "✓ Voice Access listening -> BLE mic ON"
+                "Voice Access listening -> BLE mic ON"
             )
 
             turnRoutingOn()
 
-        } else {
+            return
+        }
 
-            if (
-                !voiceAccessActive &&
-                !routeRequested
-            ) {
+        /*
+         * ========================================================
+         * VOICE ACCESS INACTIVE
+         * ========================================================
+         */
 
-                return
-            }
+        if (
+            !voiceAccessActive &&
+            !routeRequested
+        ) {
 
-            voiceAccessActive =
-                false
+            return
+        }
 
-            /*
-             * Do not immediately drop routing.
-             *
-             * This protects against tiny AppOps gaps.
-             */
+        voiceAccessActive =
+            false
 
-            mainHandler.removeCallbacks(
+        /*
+         * Cancel an older OFF timer if one exists.
+         */
+
+        mainHandler
+            .removeCallbacks(
                 delayedRouteOff
             )
 
-            mainHandler.postDelayed(
+        /*
+         * Wait briefly.
+         *
+         * If Voice Access becomes active again during this window,
+         * applyVoiceAccessState(true) cancels this runnable.
+         */
+
+        mainHandler
+            .postDelayed(
                 delayedRouteOff,
                 VOICE_ACCESS_OFF_DEBOUNCE_MS
             )
 
-            Logger.i(
-                "Voice Access RECORD_AUDIO inactive -> " +
-                    "waiting briefly before BLE mic OFF"
-            )
-        }
+        Logger.i(
+            "Voice Access RECORD_AUDIO inactive -> " +
+                "waiting before BLE mic OFF"
+        )
     }
 
     /*
@@ -623,6 +728,10 @@ class VoiceAccessMonitorService :
      */
 
     private fun turnRoutingOn() {
+
+        /*
+         * Already requested.
+         */
 
         if (
             routeRequested
@@ -639,21 +748,16 @@ class VoiceAccessMonitorService :
          * FAST PATH
          * ========================================================
          *
-         * This should be the normal path on your Fold6.
-         *
-         * Your screenshot already shows:
-         *
-         * Antonio's Buds4 Pro
-         * BLE Headset / LE Audio
+         * This should normally be used on your Fold6 because the
+         * BLE Headset / LE Audio endpoint already exists.
          */
 
-        val bleDevice =
+        val existingBle =
             routingManager
                 .findFirstBluetoothCommunicationDevice()
 
         if (
-            bleDevice !=
-            null
+            existingBle != null
         ) {
 
             Logger.i(
@@ -663,7 +767,7 @@ class VoiceAccessMonitorService :
             val result =
                 routingManager
                     .routeToBluetooth(
-                        bleDevice
+                        existingBle
                     )
 
             if (
@@ -680,6 +784,12 @@ class VoiceAccessMonitorService :
                     "Fast automatic BLE route failed: " +
                         result.reason
                 )
+
+            } else {
+
+                Logger.i(
+                    "Fast automatic BLE route active"
+                )
             }
 
             return
@@ -690,7 +800,7 @@ class VoiceAccessMonitorService :
          * SLOW RECOVERY PATH
          * ========================================================
          *
-         * Only if TYPE_BLE_HEADSET disappeared.
+         * Only used if TYPE_BLE_HEADSET disappeared.
          */
 
         if (
@@ -722,11 +832,15 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * SLOW PATH
+     * SLOW LE AUDIO ACTIVATION
      * ============================================================
      */
 
     private fun activateLeAudioSlowPath() {
+
+        /*
+         * Voice Access could have stopped before the worker starts.
+         */
 
         if (
             !shouldRemainActive()
@@ -739,13 +853,18 @@ class VoiceAccessMonitorService :
         }
 
         /*
-         * Find Buds from currently visible Bluetooth audio devices.
+         * ========================================================
+         * FIND BUDS
+         * ========================================================
          */
 
-        val buds =
+        val devices =
             routingManager
                 .availableDevices
                 .value
+
+        val buds =
+            devices
                 .firstOrNull {
 
                     it.name.contains(
@@ -756,8 +875,7 @@ class VoiceAccessMonitorService :
                 }
 
         if (
-            buds ==
-            null
+            buds == null
         ) {
 
             Logger.w(
@@ -774,10 +892,14 @@ class VoiceAccessMonitorService :
             buds.name
 
         /*
-         * --------------------------------------------------------
-         * LE AUDIO CACHE
-         * --------------------------------------------------------
+         * ========================================================
+         * CHECK/REFRESH LE AUDIO UUID CACHE
+         * ========================================================
          */
+
+        Logger.i(
+            "Voice Access slow path checking LE Audio cache"
+        )
 
         val refresh =
             LeAudioCacheRefresher
@@ -788,6 +910,10 @@ class VoiceAccessMonitorService :
                     preferredDeviceName =
                         preferredName
                 )
+
+        /*
+         * Voice Access stopped while cache work was happening.
+         */
 
         if (
             !shouldRemainActive()
@@ -815,12 +941,16 @@ class VoiceAccessMonitorService :
         }
 
         /*
-         * --------------------------------------------------------
-         * LE AUDIO PROFILE
-         * --------------------------------------------------------
+         * ========================================================
+         * CONNECT LE AUDIO PROFILE
+         * ========================================================
          */
 
-        val connect =
+        Logger.i(
+            "Voice Access slow path connecting LE Audio"
+        )
+
+        val connectResult =
             LeAudioShizukuBridge
                 .forceLeAudio(
                     context =
@@ -829,6 +959,10 @@ class VoiceAccessMonitorService :
                     preferredDeviceName =
                         preferredName
                 )
+
+        /*
+         * Voice Access stopped during connection.
+         */
 
         if (
             !shouldRemainActive()
@@ -841,10 +975,10 @@ class VoiceAccessMonitorService :
         }
 
         val connected =
-            connect.contains(
+            connectResult.contains(
                 "ACCEPTED - LE AUDIO CONNECTED"
             ) ||
-                connect.contains(
+                connectResult.contains(
                     "ACCEPTED - ALREADY CONNECTED"
                 )
 
@@ -863,7 +997,7 @@ class VoiceAccessMonitorService :
         }
 
         /*
-         * Brief settle time for TYPE_BLE_HEADSET.
+         * Give Android a short time to expose TYPE_BLE_HEADSET.
          */
 
         try {
@@ -872,10 +1006,12 @@ class VoiceAccessMonitorService :
                 BLE_SETTLE_MS
             )
 
-        } catch (
-            _: InterruptedException
-        ) {
+        } catch (_: InterruptedException) {
         }
+
+        /*
+         * Voice Access may have stopped during settle time.
+         */
 
         if (
             !shouldRemainActive()
@@ -886,6 +1022,12 @@ class VoiceAccessMonitorService :
 
             return
         }
+
+        /*
+         * ========================================================
+         * FINAL BLE ROUTE
+         * ========================================================
+         */
 
         val result =
             routingManager
@@ -905,6 +1047,12 @@ class VoiceAccessMonitorService :
 
             routeRequested =
                 false
+
+        } else {
+
+            Logger.i(
+                "Voice Access automatic BLE route active"
+            )
         }
     }
 
@@ -916,6 +1064,10 @@ class VoiceAccessMonitorService :
 
     private fun turnRoutingOffNow() {
 
+        /*
+         * Already off.
+         */
+
         if (
             !routeRequested
         ) {
@@ -924,8 +1076,8 @@ class VoiceAccessMonitorService :
         }
 
         /*
-         * If Voice Access came back while our debounce timer
-         * was waiting, leave the route alone.
+         * Voice Access became active again while the delay
+         * was running.
          */
 
         if (
@@ -939,18 +1091,23 @@ class VoiceAccessMonitorService :
             false
 
         Logger.i(
-            "✓ Voice Access stopped -> BLE mic route OFF"
+            "Voice Access stopped -> BLE mic route OFF"
         )
 
         /*
-         * This releases only AudioManager communication routing.
+         * IMPORTANT:
+         *
+         * This releases:
+         *
+         * - communication device
+         * - MODE_IN_COMMUNICATION
          *
          * It does NOT intentionally:
          *
          * - unpair Buds
-         * - remove LE cache
-         * - disable Bluetooth
-         * - disconnect LE Audio profile
+         * - clear LE Audio UUID cache
+         * - turn Bluetooth off
+         * - remove LE Audio capability
          */
 
         try {
@@ -958,9 +1115,7 @@ class VoiceAccessMonitorService :
             routingManager
                 .clearRouting()
 
-        } catch (
-            e: Throwable
-        ) {
+        } catch (e: Throwable) {
 
             Logger.e(
                 "Could not clear automatic BLE route",
@@ -971,20 +1126,22 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * SLOW PATH GUARD
+     * SHOULD SLOW PATH CONTINUE?
      * ============================================================
      */
 
     private fun shouldRemainActive():
         Boolean {
 
-        return routeRequested &&
+        return (
+            routeRequested &&
             voiceAccessActive
+        )
     }
 
     /*
      * ============================================================
-     * CLEANUP WATCHER
+     * STOP PRIVILEGED WATCHER
      * ============================================================
      */
 
@@ -992,14 +1149,16 @@ class VoiceAccessMonitorService :
         removeRemoteService: Boolean
     ) {
 
+        /*
+         * Ask remote side to stop AppOps callback.
+         */
+
         try {
 
             watcher
                 ?.stopWatch()
 
-        } catch (
-            _: Throwable
-        ) {
+        } catch (_: Throwable) {
         }
 
         watcher =
@@ -1008,17 +1167,20 @@ class VoiceAccessMonitorService :
         watcherBinding =
             false
 
+        /*
+         * Unbind Shizuku UserService.
+         */
+
         try {
 
-            Shizuku.unbindUserService(
-                watcherArgs,
-                watcherConnection,
-                removeRemoteService
-            )
+            Shizuku
+                .unbindUserService(
+                    watcherArgs,
+                    watcherConnection,
+                    removeRemoteService
+                )
 
-        } catch (
-            _: Throwable
-        ) {
+        } catch (_: Throwable) {
         }
     }
 
@@ -1034,12 +1196,17 @@ class VoiceAccessMonitorService :
             "Voice Access automation lifecycle host disconnected"
         )
 
+        /*
+         * Fail safe.
+         */
+
         voiceAccessActive =
             false
 
-        mainHandler.removeCallbacks(
-            delayedRouteOff
-        )
+        mainHandler
+            .removeCallbacks(
+                delayedRouteOff
+            )
 
         turnRoutingOffNow()
 
@@ -1066,78 +1233,108 @@ class VoiceAccessMonitorService :
         voiceAccessActive =
             false
 
-        mainHandler.removeCallbacks(
-            delayedRouteOff
-        )
+        mainHandler
+            .removeCallbacks(
+                delayedRouteOff
+            )
+
+        /*
+         * Don't leave microphone routing active if this service dies.
+         */
 
         turnRoutingOffNow()
+
+        /*
+         * Stop Shizuku AppOps watcher.
+         */
 
         stopWatcher(
             removeRemoteService =
                 true
         )
 
+        /*
+         * Remove Shizuku listeners.
+         */
+
         try {
 
-            Shizuku.removeBinderReceivedListener(
-                shizukuReceivedListener
-            )
+            Shizuku
+                .removeBinderReceivedListener(
+                    shizukuReceivedListener
+                )
 
-        } catch (
-            _: Throwable
-        ) {
+        } catch (_: Throwable) {
         }
 
         try {
 
-            Shizuku.removeBinderDeadListener(
-                shizukuDeadListener
-            )
+            Shizuku
+                .removeBinderDeadListener(
+                    shizukuDeadListener
+                )
 
-        } catch (
-            _: Throwable
-        ) {
+        } catch (_: Throwable) {
         }
+
+        /*
+         * Stop audio callbacks.
+         */
 
         try {
 
             routingManager
                 .stopMonitoring()
 
-        } catch (
-            _: Throwable
-        ) {
+        } catch (_: Throwable) {
         }
+
+        /*
+         * Kill worker.
+         */
 
         worker.shutdownNow()
 
         super.onDestroy()
     }
 
+    /*
+     * ============================================================
+     * CONSTANTS
+     * ============================================================
+     */
+
     companion object {
 
         /*
-         * Google's Voice Access package.
+         * Google Voice Access.
          */
+
         private const val
             VOICE_ACCESS_PACKAGE =
             "com.google.android.apps.accessibility.voiceaccess"
 
         /*
-         * Give tiny internal recognition gaps time to recover
-         * before releasing BLE communication routing.
+         * Small delay prevents tiny Voice Access recognition gaps
+         * from constantly flipping the Buds communication route.
          */
+
         private const val
             VOICE_ACCESS_OFF_DEBOUNCE_MS =
             1200L
+
+        /*
+         * Wait for TYPE_BLE_HEADSET after recovering LE Audio.
+         */
 
         private const val
             BLE_SETTLE_MS =
             500L
 
         /*
-         * Bump if we later modify VoiceAccessAppOpsService.
+         * Shizuku UserService version.
          */
+
         private const val
             WATCHER_SERVICE_VERSION =
             1
