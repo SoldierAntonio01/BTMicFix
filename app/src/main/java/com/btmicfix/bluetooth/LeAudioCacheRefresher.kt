@@ -3,7 +3,11 @@ package com.btmicfix.bluetooth
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothLeAudio
+import android.bluetooth.BluetoothLeAudioCodecConfig
+import android.bluetooth.BluetoothLeAudioCodecStatus
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.AttributionSource
 import android.content.Context
 import android.content.pm.PackageManager
@@ -16,37 +20,22 @@ import rikka.shizuku.Shizuku
 import rikka.shizuku.ShizukuBinderWrapper
 import java.lang.reflect.InvocationTargetException
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Refreshes Android's Bluetooth UUID cache over TRANSPORT_LE.
+ * Reads the ACTUAL negotiated LE Audio codec configuration.
  *
- * IMPORTANT:
+ * Shows:
  *
- * The previous build incorrectly required BOTH:
+ * Phone -> Buds output codec + sample rate
+ * Buds mic -> Phone input codec + sample rate
  *
- * ASCS 0x184E
- * PACS 0x1850
- *
- * before allowing LE Audio connection.
- *
- * AOSP LeAudioService.connect() actually checks only whether
- * BluetoothUuid.LE_AUDIO is present in Android's remote UUID cache.
- *
- * On this Fold6, the transport-specific refresh produced:
- *
- * ASCS 0x184E = YES
- * BASS 0x184F = YES
- * PACS 0x1850 = NO
- *
- * Live GATT separately proved PACS 0x1850 really exists.
- *
- * Therefore:
- *
- * ASCS 0x184E in Android cache = READY FOR LE AUDIO CONNECT.
- *
- * PACS remains diagnostic information only.
+ * BluetoothLeAudio.getCodecStatus() requires BLUETOOTH_PRIVILEGED,
+ * so the final Binder transaction is passed through Shizuku.
  */
-object LeAudioCacheRefresher {
+object LeAudioCodecMonitor {
 
     private const val SHELL_UID =
         2000
@@ -54,55 +43,23 @@ object LeAudioCacheRefresher {
     private const val SHELL_PACKAGE =
         "com.android.shell"
 
-    /*
-     * Android's LE_AUDIO UUID gate.
-     */
-    private const val ASCS_UUID =
-        "0000184e-0000-1000-8000-00805f9b34fb"
+    private const val PROFILE_TIMEOUT_SECONDS =
+        10L
 
-    /*
-     * Useful diagnostics only.
-     */
-    private const val PACS_UUID =
-        "00001850-0000-1000-8000-00805f9b34fb"
-
-    private const val BASS_UUID =
-        "0000184f-0000-1000-8000-00805f9b34fb"
-
-    private const val CACHE_WAIT_MS =
-        20000L
-
-    private const val CACHE_POLL_MS =
-        500L
-
-    private const val RECEIVER_WAIT_SECONDS =
+    private const val RECEIVER_TIMEOUT_SECONDS =
         5L
 
-    data class RefreshResult(
-        val requestAccepted: Boolean,
-
-        /*
-         * IMPORTANT:
-         *
-         * cacheUpdated now means:
-         *
-         * Android has ASCS / LE_AUDIO UUID 0x184E.
-         *
-         * PACS is NOT required.
-         */
-        val cacheUpdated: Boolean,
-
-        val hasAscs: Boolean,
-        val hasPacs: Boolean,
-        val hasBass: Boolean,
-
-        val text: String
+    data class CodecSnapshot(
+        val success: Boolean,
+        val outputText: String,
+        val inputText: String,
+        val details: String
     )
 
-    fun refresh(
+    fun read(
         context: Context,
         preferredDeviceName: String
-    ): RefreshResult {
+    ): CodecSnapshot {
 
         /*
          * ========================================================
@@ -118,10 +75,7 @@ object LeAudioCacheRefresher {
         ) {
 
             return failure(
-                """
-                BTMicFix does not have
-                BLUETOOTH_CONNECT permission.
-                """.trimIndent()
+                "BTMicFix does not have BLUETOOTH_CONNECT permission."
             )
         }
 
@@ -136,12 +90,7 @@ object LeAudioCacheRefresher {
             if (!Shizuku.pingBinder()) {
 
                 return failure(
-                    """
-                    Shizuku is not running.
-
-                    Open Shizuku and make sure
-                    it says Running.
-                    """.trimIndent()
+                    "Shizuku is not running."
                 )
             }
 
@@ -151,23 +100,14 @@ object LeAudioCacheRefresher {
             ) {
 
                 return failure(
-                    """
-                    BTMicFix does not have
-                    Shizuku permission.
-                    """.trimIndent()
+                    "BTMicFix does not have Shizuku permission."
                 )
             }
 
         } catch (e: Throwable) {
 
             return failure(
-                """
-                Could not communicate with Shizuku.
-
-                ${e.javaClass.name}
-
-                ${e.message}
-                """.trimIndent()
+                "Shizuku error: ${e.message}"
             )
         }
 
@@ -187,8 +127,7 @@ object LeAudioCacheRefresher {
         } catch (e: Throwable) {
 
             Logger.w(
-                "Hidden API exemption error: " +
-                    "${e.javaClass.simpleName}: ${e.message}"
+                "Hidden API exemption error: ${e.message}"
             )
         }
 
@@ -209,13 +148,9 @@ object LeAudioCacheRefresher {
 
                 null
             }
-
-        if (manager == null) {
-
-            return failure(
-                "BluetoothManager is unavailable."
-            )
-        }
+                ?: return failure(
+                    "BluetoothManager unavailable."
+                )
 
         val adapter =
             try {
@@ -225,366 +160,420 @@ object LeAudioCacheRefresher {
             } catch (e: Throwable) {
 
                 return failure(
-                    """
-                    BluetoothAdapter access failed.
-
-                    ${e.javaClass.name}
-
-                    ${e.message}
-                    """.trimIndent()
+                    "BluetoothAdapter error: ${e.message}"
                 )
             }
-
-        if (adapter == null) {
-
-            return failure(
-                "BluetoothAdapter returned NULL."
-            )
-        }
-
-        val enabled =
-            try {
-
-                adapter.isEnabled
-
-            } catch (_: Throwable) {
-
-                false
-            }
-
-        if (!enabled) {
-
-            return failure(
-                "Bluetooth is OFF."
-            )
-        }
+                ?: return failure(
+                    "BluetoothAdapter returned NULL."
+                )
 
         /*
          * ========================================================
-         * FIND REAL PAIRED BUDS
+         * PROFILE CALLBACK
          * ========================================================
          */
 
-        val bondedDevices =
+        val result =
+            AtomicReference<CodecSnapshot?>(
+                null
+            )
+
+        val proxyReference =
+            AtomicReference<BluetoothProfile?>(
+                null
+            )
+
+        val latch =
+            CountDownLatch(
+                1
+            )
+
+        val listener =
+            object :
+                BluetoothProfile.ServiceListener {
+
+                override fun onServiceConnected(
+                    profile: Int,
+                    proxy: BluetoothProfile
+                ) {
+
+                    if (
+                        profile !=
+                        BluetoothProfile.LE_AUDIO
+                    ) {
+
+                        result.set(
+                            failure(
+                                "Android returned the wrong Bluetooth profile."
+                            )
+                        )
+
+                        latch.countDown()
+
+                        return
+                    }
+
+                    proxyReference.set(
+                        proxy
+                    )
+
+                    try {
+
+                        val leAudio =
+                            proxy as? BluetoothLeAudio
+                                ?: throw IllegalStateException(
+                                    "Profile is not BluetoothLeAudio"
+                                )
+
+                        /*
+                         * ----------------------------------------
+                         * FIND CONNECTED BUDS
+                         * ----------------------------------------
+                         */
+
+                        val connected =
+                            leAudio.connectedDevices
+
+                        if (
+                            connected.isEmpty()
+                        ) {
+
+                            result.set(
+                                failure(
+                                    "No LE Audio device is currently connected."
+                                )
+                            )
+
+                            latch.countDown()
+
+                            return
+                        }
+
+                        val device =
+                            findBestDevice(
+                                connected,
+                                preferredDeviceName
+                            )
+                                ?: connected.first()
+
+                        /*
+                         * ----------------------------------------
+                         * GET LE AUDIO GROUP
+                         * ----------------------------------------
+                         */
+
+                        val groupId =
+                            leAudio.getGroupId(
+                                device
+                            )
+
+                        if (
+                            groupId ==
+                            BluetoothLeAudio.GROUP_ID_INVALID
+                        ) {
+
+                            result.set(
+                                failure(
+                                    "The connected Buds do not currently have a valid LE Audio group ID."
+                                )
+                            )
+
+                            latch.countDown()
+
+                            return
+                        }
+
+                        /*
+                         * ----------------------------------------
+                         * GET ACTUAL CODEC STATUS
+                         * ----------------------------------------
+                         */
+
+                        val codecStatus =
+                            getCodecStatusThroughShizuku(
+                                proxy =
+                                    proxy,
+
+                                groupId =
+                                    groupId
+                            )
+
+                        if (
+                            codecStatus ==
+                            null
+                        ) {
+
+                            result.set(
+                                failure(
+                                    "Android returned no active LE Audio codec status."
+                                )
+                            )
+
+                            latch.countDown()
+
+                            return
+                        }
+
+                        val outputConfig =
+                            codecStatus.outputCodecConfig
+
+                        val inputConfig =
+                            codecStatus.inputCodecConfig
+
+                        val outputText =
+                            describeConfig(
+                                outputConfig
+                            )
+
+                        val inputText =
+                            describeConfig(
+                                inputConfig
+                            )
+
+                        val name =
+                            safeName(
+                                device
+                            )
+
+                        result.set(
+                            CodecSnapshot(
+                                success =
+                                    true,
+
+                                outputText =
+                                    outputText,
+
+                                inputText =
+                                    inputText,
+
+                                details =
+                                    """
+                                    ===== BTMicFix ACTUAL LE CODEC =====
+
+                                    Device:
+                                    $name
+
+                                    LE Audio group:
+                                    $groupId
+
+
+                                    PHONE -> BUDS
+
+                                    $outputText
+
+
+                                    BUDS MIC -> PHONE
+
+                                    $inputText
+
+
+                                    These values come from Android's
+                                    current Bluetooth LE Audio codec
+                                    configuration, not from the
+                                    Developer Options preference.
+
+                                    ==================================
+                                    """.trimIndent()
+                            )
+                        )
+
+                    } catch (e: Throwable) {
+
+                        val actual =
+                            unwrap(
+                                e
+                            )
+
+                        result.set(
+                            failure(
+                                """
+                                ${actual.javaClass.name}
+
+                                ${actual.message}
+                                """.trimIndent()
+                            )
+                        )
+
+                    } finally {
+
+                        latch.countDown()
+                    }
+                }
+
+                override fun onServiceDisconnected(
+                    profile: Int
+                ) {
+
+                    if (
+                        result.get() ==
+                        null
+                    ) {
+
+                        result.set(
+                            failure(
+                                "LE Audio service disconnected."
+                            )
+                        )
+                    }
+
+                    latch.countDown()
+                }
+            }
+
+        /*
+         * ========================================================
+         * REQUEST LE AUDIO PROFILE
+         * ========================================================
+         */
+
+        val started =
             try {
 
-                adapter
-                    .bondedDevices
-                    .toList()
+                adapter.getProfileProxy(
+                    context.applicationContext,
+                    listener,
+                    BluetoothProfile.LE_AUDIO
+                )
 
             } catch (e: Throwable) {
 
                 return failure(
                     """
-                    Could not read paired Bluetooth devices.
-
-                    ${e.javaClass.name}
+                    Could not open BluetoothLeAudio profile.
 
                     ${e.message}
                     """.trimIndent()
                 )
             }
 
-        val device =
-            findBestMatchingDevice(
-                devices =
-                    bondedDevices,
-
-                preferredName =
-                    preferredDeviceName
-            )
-
-        if (device == null) {
+        if (!started) {
 
             return failure(
-                """
-                Could not identify:
-
-                $preferredDeviceName
-
-                in Android's paired Bluetooth devices.
-                """.trimIndent()
-            )
-        }
-
-        val deviceName =
-            safeDeviceLabel(
-                device
-            )
-
-        val maskedAddress =
-            maskAddress(
-                try {
-                    device.address
-                } catch (_: Throwable) {
-                    ""
-                }
-            )
-
-        /*
-         * ========================================================
-         * READ CACHE BEFORE REFRESH
-         * ========================================================
-         */
-
-        val before =
-            readCachedUuids(
-                device
-            )
-
-        val beforeAscs =
-            hasUuid(
-                before,
-                ASCS_UUID
-            )
-
-        val beforePacs =
-            hasUuid(
-                before,
-                PACS_UUID
-            )
-
-        val beforeBass =
-            hasUuid(
-                before,
-                BASS_UUID
-            )
-
-        /*
-         * ========================================================
-         * IMPORTANT CHANGE
-         * ========================================================
-         *
-         * If 184E is already cached, we are DONE.
-         *
-         * Do NOT wait for PACS.
-         *
-         * Android LeAudioService.connect() checks LE_AUDIO / 184E.
-         */
-
-        if (beforeAscs) {
-
-            return RefreshResult(
-                requestAccepted =
-                    true,
-
-                cacheUpdated =
-                    true,
-
-                hasAscs =
-                    true,
-
-                hasPacs =
-                    beforePacs,
-
-                hasBass =
-                    beforeBass,
-
-                text =
-                    """
-                    ===== BTMicFix ANDROID LE CACHE =====
-                    READY
-
-                    Device:
-                    $deviceName
-
-                    Address:
-                    $maskedAddress
-
-
-                    ANDROID CACHE
-
-                    ASCS / LE_AUDIO 0x184E:
-                    YES
-
-                    PACS 0x1850:
-                    ${yesNo(beforePacs)}
-
-                    BASS 0x184F:
-                    ${yesNo(beforeBass)}
-
-
-                    IMPORTANT:
-
-                    Android now has the LE_AUDIO
-                    UUID required by LeAudioService.
-
-                    PACS 0x1850 is NOT required
-                    in this cached UUID list for
-                    LeAudioService.connect().
-
-                    Live GATT already proved that
-                    PACS exists on the Buds.
-
-                    READY FOR LE AUDIO CONNECT.
-
-                    =====================================
-                    """.trimIndent()
+                "BluetoothLeAudio profile request returned FALSE."
             )
         }
 
         /*
          * ========================================================
-         * GET IBluetooth SERVICE
+         * WAIT
          * ========================================================
          */
 
-        val rawBluetoothService =
+        val completed =
             try {
 
-                HiddenApiBypass.invoke(
-                    BluetoothAdapter::class.java,
-                    adapter,
-                    "getBluetoothService"
+                latch.await(
+                    PROFILE_TIMEOUT_SECONDS,
+                    TimeUnit.SECONDS
                 )
 
-            } catch (first: Throwable) {
+            } catch (_: InterruptedException) {
+
+                false
+            }
+
+        val finalResult =
+            if (completed) {
+
+                result.get()
+                    ?: failure(
+                        "Codec query returned no result."
+                    )
+
+            } else {
+
+                failure(
+                    "Timed out waiting for the LE Audio codec service."
+                )
+            }
+
+        /*
+         * ========================================================
+         * RELEASE LOCAL PROFILE PROXY
+         * ========================================================
+         */
+
+        proxyReference
+            .get()
+            ?.let { proxy ->
 
                 try {
 
-                    HiddenApiBypass.invoke(
-                        adapter.javaClass,
-                        adapter,
-                        "getBluetoothService"
+                    adapter.closeProfileProxy(
+                        BluetoothProfile.LE_AUDIO,
+                        proxy
                     )
 
-                } catch (second: Throwable) {
-
-                    return failure(
-                        """
-                        Could not obtain Android's
-                        hidden IBluetooth service.
-
-                        First:
-                        ${first.javaClass.simpleName}
-                        ${first.message}
-
-                        Second:
-                        ${second.javaClass.simpleName}
-                        ${second.message}
-                        """.trimIndent()
-                    )
+                } catch (_: Throwable) {
                 }
             }
 
-        if (rawBluetoothService == null) {
+        return finalResult
+    }
 
-            return failure(
-                """
-                BluetoothAdapter.getBluetoothService()
-                returned NULL.
-                """.trimIndent()
+    /*
+     * ============================================================
+     * GET CODEC STATUS THROUGH SHIZUKU
+     * ============================================================
+     */
+
+    private fun getCodecStatusThroughShizuku(
+        proxy: BluetoothProfile,
+        groupId: Int
+    ): BluetoothLeAudioCodecStatus? {
+
+        /*
+         * Get the hidden IBluetoothLeAudio interface.
+         */
+
+        val rawService =
+            HiddenApiBypass.invoke(
+                proxy.javaClass,
+                proxy,
+                "getService"
             )
-        }
+                ?: throw IllegalStateException(
+                    "BluetoothLeAudio.getService() returned null"
+                )
 
         val rawInterface =
-            rawBluetoothService as? IInterface
-
-        if (rawInterface == null) {
-
-            return failure(
-                """
-                Unexpected Bluetooth service type:
-
-                ${rawBluetoothService.javaClass.name}
-                """.trimIndent()
-            )
-        }
+            rawService as? IInterface
+                ?: throw IllegalStateException(
+                    "LE Audio service does not implement IInterface"
+                )
 
         val rawBinder: IBinder =
             rawInterface.asBinder()
 
         if (!rawBinder.isBinderAlive) {
 
-            return failure(
-                "Android's IBluetooth Binder is not alive."
+            throw IllegalStateException(
+                "LE Audio Binder is not alive"
             )
         }
-
-        /*
-         * ========================================================
-         * WRAP BINDER THROUGH SHIZUKU
-         * ========================================================
-         */
 
         val privilegedBinder =
-            try {
-
-                ShizukuBinderWrapper(
-                    rawBinder
-                )
-
-            } catch (e: Throwable) {
-
-                return failure(
-                    """
-                    Shizuku Binder wrapper failed.
-
-                    ${e.javaClass.name}
-
-                    ${e.message}
-                    """.trimIndent()
-                )
-            }
+            ShizukuBinderWrapper(
+                rawBinder
+            )
 
         val stubClass =
-            try {
-
-                Class.forName(
-                    "android.bluetooth.IBluetooth\$Stub"
-                )
-
-            } catch (e: Throwable) {
-
-                return failure(
-                    """
-                    IBluetooth.Stub could not be loaded.
-
-                    ${e.javaClass.name}
-
-                    ${e.message}
-                    """.trimIndent()
-                )
-            }
-
-        val privilegedService =
-            try {
-
-                HiddenApiBypass.invoke(
-                    stubClass,
-                    null,
-                    "asInterface",
-                    privilegedBinder
-                )
-
-            } catch (e: Throwable) {
-
-                return failure(
-                    """
-                    Could not create privileged
-                    IBluetooth interface.
-
-                    ${e.javaClass.name}
-
-                    ${e.message}
-                    """.trimIndent()
-                )
-            }
-
-        if (privilegedService == null) {
-
-            return failure(
-                "IBluetooth.Stub.asInterface returned NULL."
+            Class.forName(
+                "android.bluetooth.IBluetoothLeAudio\$Stub"
             )
-        }
 
-        /*
-         * ========================================================
-         * SHELL ATTRIBUTION
-         * ========================================================
-         */
+        val service =
+            HiddenApiBypass.invoke(
+                stubClass,
+                null,
+                "asInterface",
+                privilegedBinder
+            )
+                ?: throw IllegalStateException(
+                    "IBluetoothLeAudio.Stub.asInterface returned null"
+                )
 
-        val shellSource =
+        val source =
             AttributionSource
                 .Builder(
                     SHELL_UID
@@ -594,328 +583,6 @@ object LeAudioCacheRefresher {
                 )
                 .build()
 
-        /*
-         * ========================================================
-         * FETCH REMOTE UUIDS OVER LE
-         * ========================================================
-         */
-
-        val fetchResult =
-            try {
-
-                callFetchRemoteUuids(
-                    service =
-                        privilegedService,
-
-                    device =
-                        device,
-
-                    attributionSource =
-                        shellSource
-                )
-
-            } catch (e: Throwable) {
-
-                val actual =
-                    unwrap(
-                        e
-                    )
-
-                return failure(
-                    """
-                    LE UUID refresh Binder call failed.
-
-                    ${actual.javaClass.name}
-
-                    ${actual.message}
-                    """.trimIndent()
-                )
-            }
-
-        if (!fetchResult.accepted) {
-
-            return RefreshResult(
-                requestAccepted =
-                    false,
-
-                cacheUpdated =
-                    false,
-
-                hasAscs =
-                    beforeAscs,
-
-                hasPacs =
-                    beforePacs,
-
-                hasBass =
-                    beforeBass,
-
-                text =
-                    """
-                    ===== BTMicFix ANDROID LE CACHE =====
-                    REQUEST REJECTED
-
-                    Device:
-                    $deviceName
-
-                    Address:
-                    $maskedAddress
-
-                    Binder method:
-                    ${fetchResult.signature}
-
-                    Android rejected the
-                    LE UUID refresh request.
-
-                    =====================================
-                    """.trimIndent()
-            )
-        }
-
-        /*
-         * ========================================================
-         * WAIT ONLY FOR 184E
-         * ========================================================
-         *
-         * THIS IS THE KEY CHANGE.
-         *
-         * Previously:
-         *
-         * wait for 184E && 1850
-         *
-         * Now:
-         *
-         * wait for 184E
-         */
-
-        val startTime =
-            System.currentTimeMillis()
-
-        var after =
-            readCachedUuids(
-                device
-            )
-
-        var afterAscs =
-            hasUuid(
-                after,
-                ASCS_UUID
-            )
-
-        var afterPacs =
-            hasUuid(
-                after,
-                PACS_UUID
-            )
-
-        var afterBass =
-            hasUuid(
-                after,
-                BASS_UUID
-            )
-
-        while (
-            System.currentTimeMillis() -
-                startTime <
-            CACHE_WAIT_MS
-        ) {
-
-            /*
-             * 184E alone means Android's LE Audio
-             * connection gate can now succeed.
-             */
-            if (afterAscs) {
-
-                break
-            }
-
-            try {
-
-                Thread.sleep(
-                    CACHE_POLL_MS
-                )
-
-            } catch (_: InterruptedException) {
-
-                break
-            }
-
-            after =
-                readCachedUuids(
-                    device
-                )
-
-            afterAscs =
-                hasUuid(
-                    after,
-                    ASCS_UUID
-                )
-
-            afterPacs =
-                hasUuid(
-                    after,
-                    PACS_UUID
-                )
-
-            afterBass =
-                hasUuid(
-                    after,
-                    BASS_UUID
-                )
-        }
-
-        /*
-         * ========================================================
-         * SUCCESS WHEN 184E APPEARS
-         * ========================================================
-         */
-
-        if (afterAscs) {
-
-            return RefreshResult(
-                requestAccepted =
-                    true,
-
-                /*
-                 * Cache is sufficiently ready for LE Audio.
-                 */
-                cacheUpdated =
-                    true,
-
-                hasAscs =
-                    true,
-
-                hasPacs =
-                    afterPacs,
-
-                hasBass =
-                    afterBass,
-
-                text =
-                    """
-                    ===== BTMicFix ANDROID LE CACHE =====
-                    SUCCESS - LE AUDIO UUID READY
-
-                    Device:
-                    $deviceName
-
-                    Address:
-                    $maskedAddress
-
-                    Binder method:
-                    ${fetchResult.signature}
-
-                    LE refresh request:
-                    ACCEPTED
-
-
-                    BEFORE CACHE
-
-                    ASCS / LE_AUDIO 0x184E:
-                    ${yesNo(beforeAscs)}
-
-                    PACS 0x1850:
-                    ${yesNo(beforePacs)}
-
-                    BASS 0x184F:
-                    ${yesNo(beforeBass)}
-
-
-                    AFTER CACHE
-
-                    ASCS / LE_AUDIO 0x184E:
-                    YES
-
-                    PACS 0x1850:
-                    ${yesNo(afterPacs)}
-
-                    BASS 0x184F:
-                    ${yesNo(afterBass)}
-
-
-                    Android now contains the UUID
-                    required by LeAudioService.connect().
-
-                    PACS does not need to appear in
-                    BluetoothDevice.getUuids() for the
-                    LE Audio connection gate.
-
-                    READY FOR LE AUDIO CONNECT.
-
-                    =====================================
-                    """.trimIndent()
-            )
-        }
-
-        /*
-         * ========================================================
-         * REAL FAILURE
-         * ========================================================
-         *
-         * Only fail if 184E is STILL missing.
-         */
-
-        return RefreshResult(
-            requestAccepted =
-                true,
-
-            cacheUpdated =
-                false,
-
-            hasAscs =
-                false,
-
-            hasPacs =
-                afterPacs,
-
-            hasBass =
-                afterBass,
-
-            text =
-                """
-                ===== BTMicFix ANDROID LE CACHE =====
-                LE AUDIO UUID STILL MISSING
-
-                Device:
-                $deviceName
-
-                Address:
-                $maskedAddress
-
-                Binder method:
-                ${fetchResult.signature}
-
-                Android accepted the refresh request,
-                but ASCS / LE_AUDIO 0x184E still did
-                not appear within
-                ${CACHE_WAIT_MS / 1000} seconds.
-
-                PACS 0x1850:
-                ${yesNo(afterPacs)}
-
-                BASS 0x184F:
-                ${yesNo(afterBass)}
-
-                No LE Audio profile connection
-                should be attempted.
-
-                =====================================
-                """.trimIndent()
-        )
-    }
-
-    /*
-     * ============================================================
-     * FETCH REMOTE UUIDS
-     * ============================================================
-     */
-
-    private fun callFetchRemoteUuids(
-        service: Any,
-        device: BluetoothDevice,
-        attributionSource: AttributionSource
-    ): FetchCallResult {
-
         val methods =
             service
                 .javaClass
@@ -923,76 +590,61 @@ object LeAudioCacheRefresher {
                 .filter {
 
                     it.name ==
-                        "fetchRemoteUuids" ||
-
-                    it.name ==
-                        "fetchRemoteUuidsWithAttribution"
+                        "getCodecStatus"
                 }
 
         /*
          * --------------------------------------------------------
-         * DIRECT SAMSUNG / ANDROID FORM
+         * DIRECT FORM
          * --------------------------------------------------------
          *
-         * This is the form your Fold6 already proved works:
-         *
-         * fetchRemoteUuids(
-         *     BluetoothDevice,
+         * getCodecStatus(
          *     int,
          *     AttributionSource
          * )
          */
 
-        val directMethod =
+        val direct =
             methods.firstOrNull { method ->
 
                 val types =
                     method.parameterTypes
 
-                types.size == 3 &&
+                types.size ==
+                    2 &&
 
                     types[0] ==
-                        BluetoothDevice::class.java &&
+                    Int::class.javaPrimitiveType &&
 
-                    types[1] ==
-                        Int::class.javaPrimitiveType &&
-
-                    types[2].name ==
-                        "android.content.AttributionSource"
+                    types[1].name ==
+                    "android.content.AttributionSource"
             }
 
         if (
-            directMethod !=
+            direct !=
             null
         ) {
 
-            directMethod.isAccessible =
+            direct.isAccessible =
                 true
 
-            val response =
-                directMethod.invoke(
-                    service,
-                    device,
-                    BluetoothDevice.TRANSPORT_LE,
-                    attributionSource
-                )
-
-            return FetchCallResult(
-                accepted =
-                    response as? Boolean
-                        ?: true,
-
-                signature =
-                    "fetchRemoteUuids(" +
-                        "BluetoothDevice, int, AttributionSource" +
-                        ")"
-            )
+            return direct.invoke(
+                service,
+                groupId,
+                source
+            ) as? BluetoothLeAudioCodecStatus
         }
 
         /*
          * --------------------------------------------------------
-         * RESULT RECEIVER FORM
+         * SYNCHRONOUS RESULT RECEIVER FORM
          * --------------------------------------------------------
+         *
+         * getCodecStatus(
+         *     int,
+         *     AttributionSource,
+         *     SynchronousResultReceiver
+         * )
          */
 
         val receiverMethod =
@@ -1001,18 +653,16 @@ object LeAudioCacheRefresher {
                 val types =
                     method.parameterTypes
 
-                types.size == 4 &&
+                types.size ==
+                    3 &&
 
                     types[0] ==
-                        BluetoothDevice::class.java &&
+                    Int::class.javaPrimitiveType &&
 
-                    types[1] ==
-                        Int::class.javaPrimitiveType &&
+                    types[1].name ==
+                    "android.content.AttributionSource" &&
 
-                    types[2].name ==
-                        "android.content.AttributionSource" &&
-
-                    types[3].name.contains(
+                    types[2].name.contains(
                         "SynchronousResultReceiver"
                     )
             }
@@ -1026,64 +676,41 @@ object LeAudioCacheRefresher {
                 true
 
             val receiver =
-                createSynchronousResultReceiver()
+                createReceiver()
 
             receiverMethod.invoke(
                 service,
-                device,
-                BluetoothDevice.TRANSPORT_LE,
-                attributionSource,
+                groupId,
+                source,
                 receiver
             )
 
-            val result =
-                awaitReceiverBoolean(
-                    receiver
-                )
-
-            return FetchCallResult(
-                accepted =
-                    result ?: true,
-
-                signature =
-                    "fetchRemoteUuids(" +
-                        "BluetoothDevice, int, " +
-                        "AttributionSource, " +
-                        "SynchronousResultReceiver" +
-                        ")"
-            )
+            return awaitReceiverValue(
+                receiver
+            ) as? BluetoothLeAudioCodecStatus
         }
 
         val signatures =
-            if (methods.isEmpty()) {
+            methods.joinToString(
+                separator = "\n"
+            ) { method ->
 
-                "NONE"
-
-            } else {
-
-                methods.joinToString(
-                    separator = "\n"
-                ) { method ->
-
-                    method.name +
-                        "(" +
-                        method.parameterTypes
-                            .joinToString(
-                                ", "
-                            ) {
-                                it.simpleName
-                            } +
-                        ") -> " +
-                        method.returnType.simpleName
-                }
+                method.name +
+                    "(" +
+                    method.parameterTypes
+                        .joinToString(
+                            ", "
+                        ) {
+                            it.simpleName
+                        } +
+                    ")"
             }
 
         throw NoSuchMethodException(
             """
-            No supported fetchRemoteUuids
-            method found.
+            No supported getCodecStatus method.
 
-            Samsung methods:
+            Samsung exposed:
 
             $signatures
             """.trimIndent()
@@ -1092,11 +719,11 @@ object LeAudioCacheRefresher {
 
     /*
      * ============================================================
-     * SYNCHRONOUS RESULT RECEIVER
+     * RESULT RECEIVER
      * ============================================================
      */
 
-    private fun createSynchronousResultReceiver():
+    private fun createReceiver():
         Any {
 
         val receiverClass =
@@ -1104,7 +731,7 @@ object LeAudioCacheRefresher {
                 "com.android.modules.utils.SynchronousResultReceiver"
             )
 
-        val method =
+        val get =
             receiverClass
                 .methods
                 .firstOrNull {
@@ -1119,10 +746,10 @@ object LeAudioCacheRefresher {
                     "SynchronousResultReceiver.get()"
                 )
 
-        method.isAccessible =
+        get.isAccessible =
             true
 
-        return method.invoke(
+        return get.invoke(
             null
         )
             ?: throw IllegalStateException(
@@ -1130,156 +757,203 @@ object LeAudioCacheRefresher {
             )
     }
 
-    private fun awaitReceiverBoolean(
+    private fun awaitReceiverValue(
         receiver: Any
-    ): Boolean? {
+    ): Any? {
 
-        return try {
+        val await =
+            receiver
+                .javaClass
+                .methods
+                .firstOrNull {
 
-            val await =
-                receiver
-                    .javaClass
-                    .methods
-                    .firstOrNull {
+                    it.name ==
+                        "awaitResultNoInterrupt" &&
 
-                        it.name ==
-                            "awaitResultNoInterrupt" &&
-
-                        it.parameterCount ==
-                            1
-                    }
-                    ?: return null
-
-            await.isAccessible =
-                true
-
-            val type =
-                await.parameterTypes[0]
-
-            val argument: Any =
-                when {
-
-                    type ==
-                        Duration::class.java ->
-
-                        Duration.ofSeconds(
-                            RECEIVER_WAIT_SECONDS
-                        )
-
-                    type ==
-                        Long::class.javaPrimitiveType ||
-
-                    type ==
-                        java.lang.Long::class.java ->
-
-                        RECEIVER_WAIT_SECONDS *
-                            1000L
-
-                    else ->
-
-                        return null
+                    it.parameterCount ==
+                        1
                 }
+                ?: return null
 
-            val result =
-                await.invoke(
-                    receiver,
-                    argument
-                )
-                    ?: return null
+        await.isAccessible =
+            true
 
-            val getValue =
-                result
-                    .javaClass
-                    .methods
-                    .firstOrNull {
+        val argument: Any =
+            when (
+                await.parameterTypes[0]
+            ) {
 
-                        it.name ==
-                            "getValue" &&
+                Duration::class.java ->
 
-                        it.parameterCount ==
-                            1
-                    }
-                    ?: return null
+                    Duration.ofSeconds(
+                        RECEIVER_TIMEOUT_SECONDS
+                    )
 
-            getValue.isAccessible =
-                true
+                Long::class.javaPrimitiveType,
+                java.lang.Long::class.java ->
 
-            getValue.invoke(
-                result,
-                false
-            ) as? Boolean
+                    RECEIVER_TIMEOUT_SECONDS *
+                        1000L
 
-        } catch (
-            e: InvocationTargetException
+                else ->
+
+                    return null
+            }
+
+        val result =
+            await.invoke(
+                receiver,
+                argument
+            )
+                ?: return null
+
+        val getValue =
+            result
+                .javaClass
+                .methods
+                .firstOrNull {
+
+                    it.name ==
+                        "getValue" &&
+
+                    it.parameterCount ==
+                        1
+                }
+                ?: return null
+
+        getValue.isAccessible =
+            true
+
+        return getValue.invoke(
+            result,
+            *arrayOfNulls<Any>(
+                1
+            )
+        )
+    }
+
+    /*
+     * ============================================================
+     * CONFIG DESCRIPTION
+     * ============================================================
+     */
+
+    private fun describeConfig(
+        config: BluetoothLeAudioCodecConfig?
+    ): String {
+
+        if (
+            config ==
+            null
         ) {
 
-            throw (
-                e.targetException
-                    ?: e
-                )
-
-        } catch (e: Throwable) {
-
-            Logger.w(
-                "Receiver result unavailable: " +
-                    "${e.javaClass.simpleName}: ${e.message}"
-            )
-
-            null
+            return "Not active"
         }
-    }
 
-    /*
-     * ============================================================
-     * CACHE HELPERS
-     * ============================================================
-     */
+        val codecName =
+            try {
 
-    private fun readCachedUuids(
-        device: BluetoothDevice
-    ): List<String> {
+                config.codecName
 
-        return try {
+            } catch (_: Throwable) {
 
-            device
-                .uuids
-                ?.map {
+                when (
+                    config.codecType
+                ) {
 
-                    it.uuid
-                        .toString()
-                        .lowercase()
+                    0 ->
+                        "LC3"
+
+                    1 ->
+                        "Opus"
+
+                    2 ->
+                        "Opus Hi-Res"
+
+                    else ->
+                        "Codec ${config.codecType}"
                 }
-                ?.distinct()
-                ?.sorted()
-                ?: emptyList()
+            }
 
-        } catch (_: Throwable) {
+        val sampleRate =
+            formatSampleRate(
+                config.sampleRate
+            )
 
-            emptyList()
-        }
+        return "$codecName • $sampleRate"
     }
 
-    private fun hasUuid(
-        uuids: List<String>,
-        uuid: String
-    ): Boolean {
+    /*
+     * ============================================================
+     * SAMPLE RATE BIT MASK
+     * ============================================================
+     *
+     * Avoid referencing API-35 constants directly because this
+     * project currently compiles against SDK 34.
+     */
 
-        return uuids.any {
+    private fun formatSampleRate(
+        mask: Int
+    ): String {
 
-            it.equals(
-                uuid,
-                ignoreCase = true
+        if (
+            mask ==
+            0
+        ) {
+
+            return "Sample rate unavailable"
+        }
+
+        val rates =
+            listOf(
+                1 to "8 kHz",
+                2 to "11.025 kHz",
+                4 to "16 kHz",
+                8 to "22.05 kHz",
+                16 to "24 kHz",
+                32 to "32 kHz",
+                64 to "44.1 kHz",
+                128 to "48 kHz",
+                256 to "88.2 kHz",
+                512 to "96 kHz",
+                1024 to "176.4 kHz",
+                2048 to "192 kHz",
+                4096 to "384 kHz"
+            )
+
+        val active =
+            rates
+                .filter {
+                    pair ->
+
+                    mask and pair.first !=
+                        0
+                }
+                .map {
+                    it.second
+                }
+
+        return if (
+            active.isEmpty()
+        ) {
+
+            "Unknown rate mask $mask"
+
+        } else {
+
+            active.joinToString(
+                " / "
             )
         }
     }
 
     /*
      * ============================================================
-     * FIND BUDS
+     * DEVICE MATCH
      * ============================================================
      */
 
-    private fun findBestMatchingDevice(
+    private fun findBestDevice(
         devices: List<BluetoothDevice>,
         preferredName: String
     ): BluetoothDevice? {
@@ -1288,201 +962,100 @@ object LeAudioCacheRefresher {
             preferredName.trim()
 
         devices
-            .firstOrNull { device ->
+            .firstOrNull {
 
-                val alias =
-                    try {
-                        device.alias
-                    } catch (_: Throwable) {
-                        null
-                    }
-
-                alias?.equals(
-                    wanted,
-                    ignoreCase = true
-                ) == true
+                safeName(it)
+                    .equals(
+                        wanted,
+                        ignoreCase =
+                            true
+                    )
             }
             ?.let {
 
                 return it
             }
 
-        devices
-            .firstOrNull { device ->
-
-                val name =
-                    try {
-                        device.name
-                    } catch (_: Throwable) {
-                        null
-                    }
-
-                name?.equals(
-                    wanted,
-                    ignoreCase = true
-                ) == true
-            }
-            ?.let {
-
-                return it
-            }
-
-        val buds4 =
+        val buds =
             devices.filter {
 
-                safeDeviceLabel(it)
+                safeName(it)
                     .contains(
-                        "Buds4 Pro",
-                        ignoreCase = true
+                        "Buds",
+                        ignoreCase =
+                            true
                     )
             }
 
-        if (
-            buds4.size ==
+        return if (
+            buds.size ==
             1
         ) {
 
-            return buds4.first()
+            buds.first()
+
+        } else {
+
+            null
         }
-
-        val budsPro =
-            devices.filter {
-
-                val label =
-                    safeDeviceLabel(it)
-
-                label.contains(
-                    "Buds",
-                    ignoreCase = true
-                ) &&
-                    label.contains(
-                        "Pro",
-                        ignoreCase = true
-                    )
-            }
-
-        if (
-            budsPro.size ==
-            1
-        ) {
-
-            return budsPro.first()
-        }
-
-        return null
     }
 
-    private fun safeDeviceLabel(
+    private fun safeName(
         device: BluetoothDevice
     ): String {
 
-        val alias =
-            try {
-                device.alias
-            } catch (_: Throwable) {
-                null
-            }
+        return try {
 
-        val name =
-            try {
-                device.name
-            } catch (_: Throwable) {
-                null
-            }
+            device.alias
+                ?: device.name
+                ?: "Bluetooth Device"
 
-        return when {
+        } catch (_: Throwable) {
 
-            !alias.isNullOrBlank() ->
-                alias
-
-            !name.isNullOrBlank() ->
-                name
-
-            else ->
-                "Unnamed Bluetooth Device"
+            "Bluetooth Device"
         }
-    }
-
-    private fun maskAddress(
-        address: String
-    ): String {
-
-        if (
-            address.length <
-            5
-        ) {
-
-            return "REDACTED"
-        }
-
-        return "XX:XX:XX:XX:" +
-            address.takeLast(
-                5
-            )
     }
 
     private fun unwrap(
-        throwable: Throwable
+        error: Throwable
     ): Throwable {
 
         return if (
-            throwable is InvocationTargetException
+            error is InvocationTargetException
         ) {
 
-            throwable.targetException
-                ?: throwable
+            error.targetException
+                ?: error
 
         } else {
 
-            throwable
-        }
-    }
-
-    private fun yesNo(
-        value: Boolean
-    ): String {
-
-        return if (value) {
-            "YES"
-        } else {
-            "NO"
+            error
         }
     }
 
     private fun failure(
-        details: String
-    ): RefreshResult {
+        message: String
+    ): CodecSnapshot {
 
-        return RefreshResult(
-            requestAccepted =
+        return CodecSnapshot(
+            success =
                 false,
 
-            cacheUpdated =
-                false,
+            outputText =
+                "Unavailable",
 
-            hasAscs =
-                false,
+            inputText =
+                "Unavailable",
 
-            hasPacs =
-                false,
-
-            hasBass =
-                false,
-
-            text =
+            details =
                 """
-                ===== BTMicFix ANDROID LE CACHE =====
+                ===== BTMicFix ACTUAL LE CODEC =====
                 FAILED
 
-                $details
+                $message
 
-                =====================================
+                ==================================
                 """.trimIndent()
         )
     }
-
-    private data class FetchCallResult(
-        val accepted: Boolean,
-        val signature: String
-    )
 }
