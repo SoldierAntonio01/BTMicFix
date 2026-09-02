@@ -1,56 +1,72 @@
 package com.btmicfix.automation
 
+import android.app.Notification
 import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
+import android.media.MediaRecorder
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import com.btmicfix.audio.AudioRoutingManager
 import com.btmicfix.bluetooth.LeAudioCacheRefresher
 import com.btmicfix.shizuku.LeAudioShizukuBridge
 import com.btmicfix.util.Logger
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * BTMicFix automatic Voice Access routing.
  *
- * TARGET BEHAVIOR:
+ * GOAL:
  *
- * Voice Access NOT recording
- *          ↓
- * BTMicFix Idle
+ * Voice Access NOT listening
+ *        ↓
+ * BTMicFix = Idle
  *
- * Voice Access starts recording
- *          ↓
- * BLE Buds communication route ON
+ * Voice Access starts listening
+ *        ↓
+ * Buds BLE microphone route ON
  *
- * Voice Access stops recording
- *          ↓
- * BLE communication route OFF
+ * Voice Access stops listening
+ *        ↓
+ * Buds communication route OFF
+ * BTMicFix = Idle
  *
  *
  * IMPORTANT:
  *
- * We identify Voice Access by its Android UID.
+ * There is NO permanent BLE communication route.
  *
- * We DO NOT depend on:
+ * There is NO polling loop.
  *
- * - notification wording
- * - "Pause" button text
- * - Gemini text
- * - Voice Access UI
- *
- * We use Android's actual recording configuration.
+ * Android's AudioRecordingCallback tells us when
+ * recording state actually changes.
  *
  *
- * ALSO IMPORTANT:
+ * DETECTION:
  *
- * Turning routing OFF does NOT intentionally disconnect
- * the LE Audio Bluetooth profile.
+ * First choice:
  *
- * We only release the communication device.
+ * Read Voice Access recording client UID using
+ * Android's hidden AudioRecordingConfiguration.getClientUid()
+ * through HiddenApiBypass.
  *
- * This allows the Buds to stay connected without keeping
- * the microphone route permanently active.
+ * Fallback:
+ *
+ * If Samsung doesn't expose the UID, require:
+ *
+ * 1. Voice Access notification is present
+ * 2. an active unsilenced voice-recognition recording exists
+ *
+ *
+ * ROUTING OFF:
+ *
+ * clearCommunicationDevice()
+ *
+ * The LE Audio profile itself remains connected.
+ *
+ * That means music/Bluetooth does NOT need a full profile
+ * reconnect every time Voice Access stops listening.
  */
 class VoiceAccessMonitorService :
     NotificationListenerService() {
@@ -69,17 +85,26 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * VOICE ACCESS UID
+     * VOICE ACCESS IDENTIFICATION
      * ============================================================
      */
 
     private var voiceAccessUid:
         Int =
-        -1
+        UID_UNKNOWN
+
+    /*
+     * Used only as fallback if Samsung does not expose
+     * getClientUid().
+     */
+
+    @Volatile
+    private var voiceAccessNotificationPresent =
+        false
 
     /*
      * ============================================================
-     * STATE
+     * CURRENT STATE
      * ============================================================
      */
 
@@ -107,8 +132,13 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * RECORDING CALLBACK
+     * AUDIO RECORDING CALLBACK
      * ============================================================
+     *
+     * Event driven.
+     *
+     * No 250ms polling.
+     * No repeating timer.
      */
 
     private val recordingCallback =
@@ -144,44 +174,77 @@ class VoiceAccessMonitorService :
             "Voice Access automatic routing service created"
         )
 
+        /*
+         * --------------------------------------------------------
+         * HIDDEN API ACCESS
+         * --------------------------------------------------------
+         */
+
+        try {
+
+            HiddenApiBypass
+                .setHiddenApiExemptions(
+                    "Landroid/media/"
+                )
+
+            Logger.i(
+                "Audio hidden API exemption enabled"
+            )
+
+        } catch (e: Throwable) {
+
+            Logger.w(
+                "Could not enable audio hidden API exemption: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        }
+
+        /*
+         * --------------------------------------------------------
+         * AUDIO MANAGER
+         * --------------------------------------------------------
+         */
+
         audioManager =
             getSystemService(
                 AudioManager::class.java
             )
+
+        /*
+         * --------------------------------------------------------
+         * ROUTING MANAGER
+         * --------------------------------------------------------
+         *
+         * startMonitoring() does NOT activate BLE routing.
+         *
+         * It only watches devices and route changes.
+         */
 
         routingManager =
             AudioRoutingManager(
                 applicationContext
             )
 
-        /*
-         * Start the routing manager's event-driven monitoring.
-         *
-         * This does NOT enable BLE routing.
-         *
-         * It only watches available audio devices.
-         */
-
         routingManager
             .startMonitoring()
 
         /*
-         * ========================================================
-         * FIND VOICE ACCESS UID
-         * ========================================================
+         * --------------------------------------------------------
+         * VOICE ACCESS UID
+         * --------------------------------------------------------
          */
 
         voiceAccessUid =
             findVoiceAccessUid()
 
         Logger.i(
-            "Voice Access UID = $voiceAccessUid"
+            "Voice Access application UID = $voiceAccessUid"
         )
 
         /*
-         * ========================================================
-         * LISTEN FOR MICROPHONE RECORDING CHANGES
-         * ========================================================
+         * --------------------------------------------------------
+         * RECORDING CALLBACK
+         * --------------------------------------------------------
          */
 
         try {
@@ -193,13 +256,13 @@ class VoiceAccessMonitorService :
                 )
 
             Logger.i(
-                "Voice Access recording callback registered"
+                "Audio recording callback registered"
             )
 
         } catch (e: Throwable) {
 
             Logger.e(
-                "Could not register recording callback",
+                "Could not register audio recording callback",
                 e
             )
         }
@@ -207,7 +270,7 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * LISTENER CONNECTED
+     * NOTIFICATION LISTENER READY
      * ============================================================
      */
 
@@ -216,20 +279,62 @@ class VoiceAccessMonitorService :
         super.onListenerConnected()
 
         Logger.i(
-            "BTMicFix automation service connected"
+            "BTMicFix Voice Access automation connected"
         )
 
         /*
-         * Voice Access might already be running when our
-         * service starts.
+         * Voice Access might already be running/listening.
          */
+
+        refreshVoiceAccessNotificationPresence()
 
         checkCurrentRecordingState()
     }
 
     /*
      * ============================================================
-     * FIND VOICE ACCESS UID
+     * VOICE ACCESS NOTIFICATION CHANGED
+     * ============================================================
+     *
+     * We do NOT parse its wording.
+     *
+     * This is only a fallback signal if hidden UID detection
+     * is unavailable.
+     */
+
+    override fun onNotificationPosted(
+        sbn: StatusBarNotification
+    ) {
+
+        if (
+            sbn.packageName ==
+            VOICE_ACCESS_PACKAGE
+        ) {
+
+            refreshVoiceAccessNotificationPresence()
+
+            checkCurrentRecordingState()
+        }
+    }
+
+    override fun onNotificationRemoved(
+        sbn: StatusBarNotification
+    ) {
+
+        if (
+            sbn.packageName ==
+            VOICE_ACCESS_PACKAGE
+        ) {
+
+            refreshVoiceAccessNotificationPresence()
+
+            checkCurrentRecordingState()
+        }
+    }
+
+    /*
+     * ============================================================
+     * FIND VOICE ACCESS APPLICATION UID
      * ============================================================
      */
 
@@ -238,6 +343,7 @@ class VoiceAccessMonitorService :
 
         return try {
 
+            @Suppress("DEPRECATION")
             val info =
                 packageManager
                     .getApplicationInfo(
@@ -249,18 +355,107 @@ class VoiceAccessMonitorService :
 
         } catch (e: Throwable) {
 
-            Logger.e(
-                "Could not find Voice Access package UID",
-                e
+            Logger.w(
+                "Could not find Voice Access application UID: " +
+                    "${e.message}"
             )
 
-            -1
+            UID_UNKNOWN
         }
     }
 
     /*
      * ============================================================
-     * CURRENT RECORDINGS
+     * HIDDEN CLIENT UID
+     * ============================================================
+     *
+     * IMPORTANT:
+     *
+     * AudioRecordingConfiguration.clientUid is NOT part of the
+     * public Android SDK.
+     *
+     * That's why the previous code failed at compile time.
+     *
+     * We invoke hidden getClientUid() by name instead.
+     */
+
+    private fun getHiddenClientUid(
+        config:
+            AudioRecordingConfiguration
+    ): Int {
+
+        return try {
+
+            val value =
+                HiddenApiBypass.invoke(
+                    AudioRecordingConfiguration::class.java,
+                    config,
+                    "getClientUid"
+                )
+
+            when (value) {
+
+                is Int ->
+                    value
+
+                is Number ->
+                    value.toInt()
+
+                else ->
+                    UID_UNKNOWN
+            }
+
+        } catch (e: Throwable) {
+
+            /*
+             * Don't spam logs for every config change.
+             *
+             * UID_UNKNOWN tells the code below to use
+             * our event-driven fallback detection.
+             */
+
+            UID_UNKNOWN
+        }
+    }
+
+    /*
+     * ============================================================
+     * VOICE ACCESS NOTIFICATION PRESENCE
+     * ============================================================
+     */
+
+    private fun refreshVoiceAccessNotificationPresence() {
+
+        voiceAccessNotificationPresent =
+            try {
+
+                activeNotifications
+                    ?.any {
+
+                        it.packageName ==
+                            VOICE_ACCESS_PACKAGE
+                    }
+                    ?: false
+
+            } catch (e: Throwable) {
+
+                Logger.w(
+                    "Could not read active notifications: " +
+                        "${e.message}"
+                )
+
+                false
+            }
+
+        Logger.i(
+            "Voice Access notification present = " +
+                voiceAccessNotificationPresent
+        )
+    }
+
+    /*
+     * ============================================================
+     * CURRENT RECORDING STATE
      * ============================================================
      */
 
@@ -289,7 +484,7 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * DETECT VOICE ACCESS
+     * DETECT VOICE ACCESS RECORDING
      * ============================================================
      */
 
@@ -299,13 +494,13 @@ class VoiceAccessMonitorService :
     ) {
 
         /*
-         * If Voice Access wasn't installed when this service
-         * started, try to find it again.
+         * Voice Access may have been updated/reinstalled while
+         * BTMicFix stayed running.
          */
 
         if (
-            voiceAccessUid <
-            0
+            voiceAccessUid ==
+            UID_UNKNOWN
         ) {
 
             voiceAccessUid =
@@ -314,41 +509,124 @@ class VoiceAccessMonitorService :
 
         /*
          * ========================================================
-         * THE IMPORTANT CHECK
+         * METHOD 1
+         * EXACT UID MATCH
          * ========================================================
-         *
-         * Is there an ACTIVE recording whose client UID belongs
-         * specifically to Google's Voice Access app?
          */
 
-        val recording =
-            configs.any {
-                    config ->
+        var uidInformationAvailable =
+            false
 
-                val uid =
-                    try {
+        var exactVoiceAccessRecording =
+            false
 
-                        config.clientUid
+        for (
+            config in configs
+        ) {
 
-                    } catch (_: Throwable) {
+            val silenced =
+                try {
 
-                        -1
-                    }
+                    config.isClientSilenced
 
-                val silenced =
-                    try {
+                } catch (_: Throwable) {
 
-                        config.isClientSilenced
+                    false
+                }
 
-                    } catch (_: Throwable) {
+            if (silenced) {
 
-                        false
-                    }
+                continue
+            }
+
+            val uid =
+                getHiddenClientUid(
+                    config
+                )
+
+            if (
+                uid !=
+                UID_UNKNOWN
+            ) {
+
+                uidInformationAvailable =
+                    true
+            }
+
+            if (
+                uid !=
+                UID_UNKNOWN &&
+
+                voiceAccessUid !=
+                UID_UNKNOWN &&
 
                 uid ==
-                    voiceAccessUid &&
-                    !silenced
+                voiceAccessUid
+            ) {
+
+                exactVoiceAccessRecording =
+                    true
+
+                break
             }
+        }
+
+        /*
+         * ========================================================
+         * METHOD 2
+         * FALLBACK
+         * ========================================================
+         *
+         * Only used if Android/Samsung doesn't let us read
+         * recording UIDs.
+         *
+         * We require:
+         *
+         * Voice Access notification present
+         *
+         * AND
+         *
+         * active voice-like recording.
+         */
+
+        val fallbackVoiceRecording =
+            if (
+                !uidInformationAvailable
+            ) {
+
+                voiceAccessNotificationPresent &&
+                    configs.any {
+                            config ->
+
+                        isVoiceLikeRecording(
+                            config
+                        )
+                    }
+
+            } else {
+
+                false
+            }
+
+        val recording =
+            exactVoiceAccessRecording ||
+                fallbackVoiceRecording
+
+        /*
+         * ========================================================
+         * DEBUG
+         * ========================================================
+         */
+
+        Logger.i(
+            "Voice Access detection: " +
+                "configs=${configs.size}, " +
+                "uidInfo=$uidInformationAvailable, " +
+                "exact=$exactVoiceAccessRecording, " +
+                "notification=$voiceAccessNotificationPresent, " +
+                "fallback=$fallbackVoiceRecording, " +
+                "result=$recording"
+        )
 
         /*
          * Nothing changed.
@@ -365,10 +643,16 @@ class VoiceAccessMonitorService :
         voiceAccessRecording =
             recording
 
+        /*
+         * ========================================================
+         * STATE CHANGED
+         * ========================================================
+         */
+
         if (recording) {
 
             Logger.i(
-                "✓ Voice Access started microphone recording"
+                "✓ Voice Access STARTED listening"
             )
 
             turnRoutingOn()
@@ -376,10 +660,74 @@ class VoiceAccessMonitorService :
         } else {
 
             Logger.i(
-                "✓ Voice Access stopped microphone recording"
+                "✓ Voice Access STOPPED listening"
             )
 
             turnRoutingOff()
+        }
+    }
+
+    /*
+     * ============================================================
+     * VOICE-LIKE FALLBACK RECORDING
+     * ============================================================
+     */
+
+    private fun isVoiceLikeRecording(
+        config:
+            AudioRecordingConfiguration
+    ): Boolean {
+
+        val silenced =
+            try {
+
+                config.isClientSilenced
+
+            } catch (_: Throwable) {
+
+                false
+            }
+
+        if (silenced) {
+
+            return false
+        }
+
+        val clientSource =
+            try {
+
+                config.clientAudioSource
+
+            } catch (_: Throwable) {
+
+                MediaRecorder.AudioSource.DEFAULT
+            }
+
+        /*
+         * Prefer actual speech-recognition style sources.
+         */
+
+        return when (
+            clientSource
+        ) {
+
+            MediaRecorder.AudioSource.VOICE_RECOGNITION ->
+                true
+
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION ->
+                true
+
+            MediaRecorder.AudioSource.MIC ->
+                true
+
+            MediaRecorder.AudioSource.DEFAULT ->
+                true
+
+            MediaRecorder.AudioSource.UNPROCESSED ->
+                true
+
+            else ->
+                false
         }
     }
 
@@ -392,7 +740,7 @@ class VoiceAccessMonitorService :
     private fun turnRoutingOn() {
 
         /*
-         * Already requested.
+         * Already active/requested.
          */
 
         if (
@@ -405,17 +753,22 @@ class VoiceAccessMonitorService :
         routeRequested =
             true
 
+        Logger.i(
+            "Voice Access ON -> requesting Buds BLE microphone"
+        )
+
         /*
          * ========================================================
          * FAST PATH
          * ========================================================
          *
-         * Your phone already normally has:
+         * Your Fold already normally shows:
          *
          * Antonio's Buds4 Pro
          * BLE Headset / LE Audio
          *
-         * If it exists, routing takes only one call.
+         * If that endpoint already exists, there is no reason
+         * to do cache/Shizuku/profile work.
          */
 
         val existingBle =
@@ -428,7 +781,7 @@ class VoiceAccessMonitorService :
         ) {
 
             Logger.i(
-                "Voice Access ON -> fast BLE routing"
+                "BLE headset exists -> fast automatic routing"
             )
 
             val result =
@@ -438,8 +791,22 @@ class VoiceAccessMonitorService :
                     )
 
             Logger.i(
-                "Voice Access fast route: $result"
+                "Fast automatic route result: $result"
             )
+
+            /*
+             * If this somehow failed, let another recording
+             * transition try again rather than constantly retrying.
+             */
+
+            if (
+                result is
+                AudioRoutingManager.RoutingState.Failed
+            ) {
+
+                routeRequested =
+                    false
+            }
 
             return
         }
@@ -449,7 +816,9 @@ class VoiceAccessMonitorService :
          * SLOW PATH
          * ========================================================
          *
-         * Only needed if Android lost TYPE_BLE_HEADSET.
+         * TYPE_BLE_HEADSET disappeared.
+         *
+         * Re-establish LE Audio in background.
          */
 
         if (
@@ -481,14 +850,14 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * SLOW LE AUDIO SETUP
+     * SLOW LE AUDIO ACTIVATION
      * ============================================================
      */
 
     private fun activateLeAudioSlowPath() {
 
         /*
-         * Voice Access may have stopped already.
+         * Voice Access may already have stopped.
          */
 
         if (
@@ -543,7 +912,7 @@ class VoiceAccessMonitorService :
 
         /*
          * ========================================================
-         * ANDROID LE AUDIO CACHE
+         * LE AUDIO UUID CACHE
          * ========================================================
          */
 
@@ -593,7 +962,7 @@ class VoiceAccessMonitorService :
          */
 
         Logger.i(
-            "Automatic mode connecting LE Audio"
+            "Automatic mode connecting LE Audio profile"
         )
 
         val connectResult =
@@ -624,9 +993,7 @@ class VoiceAccessMonitorService :
                     "ACCEPTED - ALREADY CONNECTED"
                 )
 
-        if (
-            !connected
-        ) {
+        if (!connected) {
 
             Logger.w(
                 "Automatic LE Audio connection failed"
@@ -639,8 +1006,7 @@ class VoiceAccessMonitorService :
         }
 
         /*
-         * Give Android time to expose the BLE communication
-         * endpoint.
+         * Let Android expose TYPE_BLE_HEADSET.
          */
 
         try {
@@ -677,6 +1043,15 @@ class VoiceAccessMonitorService :
         Logger.i(
             "Automatic LE route result: $result"
         )
+
+        if (
+            result is
+            AudioRoutingManager.RoutingState.Failed
+        ) {
+
+            routeRequested =
+                false
+        }
     }
 
     /*
@@ -686,6 +1061,10 @@ class VoiceAccessMonitorService :
      */
 
     private fun turnRoutingOff() {
+
+        /*
+         * Already idle.
+         */
 
         if (
             !routeRequested
@@ -702,18 +1081,19 @@ class VoiceAccessMonitorService :
         )
 
         /*
-         * ========================================================
-         * IMPORTANT
-         * ========================================================
+         * IMPORTANT:
          *
-         * This does NOT intentionally:
+         * clearRouting() releases:
          *
-         * - unpair Buds
-         * - disconnect Bluetooth
-         * - remove LE Audio cache
-         * - disable LE Audio profile
+         * communication device
+         * MODE_IN_COMMUNICATION
          *
-         * It just releases the communication/microphone route.
+         * It does NOT intentionally:
+         *
+         * unpair the Buds
+         * erase LE Audio cache
+         * shut Bluetooth off
+         * remove LE profile support
          */
 
         try {
@@ -724,7 +1104,7 @@ class VoiceAccessMonitorService :
         } catch (e: Throwable) {
 
             Logger.e(
-                "Could not release automatic route",
+                "Could not release automatic BLE route",
                 e
             )
         }
@@ -732,7 +1112,7 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
-     * SHOULD ROUTE STILL BE ACTIVE?
+     * SHOULD SLOW ACTIVATION CONTINUE?
      * ============================================================
      */
 
@@ -741,6 +1121,29 @@ class VoiceAccessMonitorService :
 
         return routeRequested &&
             voiceAccessRecording
+    }
+
+    /*
+     * ============================================================
+     * LISTENER DISCONNECTED
+     * ============================================================
+     */
+
+    override fun onListenerDisconnected() {
+
+        Logger.w(
+            "Voice Access automation listener disconnected"
+        )
+
+        voiceAccessNotificationPresent =
+            false
+
+        voiceAccessRecording =
+            false
+
+        turnRoutingOff()
+
+        super.onListenerDisconnected()
     }
 
     /*
@@ -754,6 +1157,9 @@ class VoiceAccessMonitorService :
         Logger.i(
             "Voice Access automation service destroyed"
         )
+
+        voiceAccessNotificationPresent =
+            false
 
         voiceAccessRecording =
             false
@@ -798,6 +1204,10 @@ class VoiceAccessMonitorService :
         private const val
             VOICE_ACCESS_PACKAGE =
             "com.google.android.apps.accessibility.voiceaccess"
+
+        private const val
+            UID_UNKNOWN =
+            -1
 
         private const val
             BLE_SETTLE_MS =
