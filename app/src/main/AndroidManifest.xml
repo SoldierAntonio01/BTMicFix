@@ -1,30 +1,40 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Bluetooth permissions (Android 12+) -->
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- Audio routing -->
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission
+        android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
-    <!-- Companion Device Manager background execution -->
-    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
-    <uses-permission android:name="android.permission.REQUEST_COMPANION_USE_DATA_IN_BACKGROUND" />
-    <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
-    <uses-permission android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
+    <uses-permission
+        android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
 
-    <!-- Foreground service for persistent routing notification -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission
+        android:name="android.permission.REQUEST_COMPANION_USE_DATA_IN_BACKGROUND" />
 
-    <!-- Bluetooth feature declaration (not required, but informational) -->
+    <uses-permission
+        android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
+
+    <uses-permission
+        android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
+
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS" />
+
     <uses-feature
         android:name="android.hardware.bluetooth"
         android:required="true" />
 
-    <!-- Companion device setup feature is REQUIRED to use CompanionDeviceManager -->
     <uses-feature
         android:name="android.software.companion_device_setup"
         android:required="true" />
@@ -38,18 +48,58 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.BTMicFix">
 
-        <!-- Main Activity -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:theme="@style/Theme.BTMicFix">
+
             <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+
+                <action
+                    android:name="android.intent.action.MAIN" />
+
+                <category
+                    android:name="android.intent.category.LAUNCHER" />
+
             </intent-filter>
+
         </activity>
 
-        <!-- Shizuku Provider (optional — app works without Shizuku) -->
+        <activity
+            android:name=".assistant.ToggleAssistActivity"
+            android:label="BTMicFix Toggle"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+
+            <intent-filter>
+
+                <action
+                    android:name="android.intent.action.ASSIST" />
+
+                <category
+                    android:name="android.intent.category.DEFAULT" />
+
+            </intent-filter>
+
+            <intent-filter>
+
+                <action
+                    android:name="android.intent.action.VOICE_COMMAND" />
+
+                <category
+                    android:name="android.intent.category.DEFAULT" />
+
+            </intent-filter>
+
+        </activity>
+
+        <service
+            android:name=".service.RoutingToggleService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -58,17 +108,20 @@
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
             tools:ignore="MissingClass" />
 
-        <!-- Companion Device Service (wakes when BT earbuds connect) -->
         <service
             android:name=".companion.BTCompanionService"
             android:exported="true"
             android:foregroundServiceType="connectedDevice"
             android:permission="android.permission.BIND_COMPANION_DEVICE_SERVICE">
-            <intent-filter>
-                <action android:name="android.companion.CompanionDeviceService" />
-            </intent-filter>
-        </service>
 
+            <intent-filter>
+
+                <action
+                    android:name="android.companion.CompanionDeviceService" />
+
+            </intent-filter>
+
+        </service>
 
     </application>
 
