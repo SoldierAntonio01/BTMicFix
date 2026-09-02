@@ -34,27 +34,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * BTMicFix LE Audio diagnostic / activation screen.
+ * BTMicFix LE Audio activation screen.
  *
- * Full safe sequence:
+ * IMPORTANT:
  *
- * 1. Verify Buds expose real LE Audio services over live GATT.
+ * Android's LE Audio connection gate requires the cached
+ * BluetoothUuid.LE_AUDIO / ASCS UUID 0x184E.
  *
- * 2. Ask Android's own Bluetooth stack to refresh UUIDs
- *    specifically over TRANSPORT_LE through Shizuku.
- *
- * 3. Verify BluetoothDevice.getUuids() now contains:
- *
- *    ASCS 0x184E
- *    PACS 0x1850
- *
- * 4. ONLY if Android's cache is correct:
- *
- *    attempt BluetoothLeAudio connection.
- *
- * 5. ONLY if LE Audio actually connects:
- *
- *    allow AudioRoutingManager to select TYPE_BLE_HEADSET.
+ * PACS 0x1850 is useful diagnostic information but is NOT
+ * required in BluetoothDevice.getUuids() before connecting.
  */
 @OptIn(
     ExperimentalMaterial3Api::class
@@ -67,12 +55,6 @@ fun HomeScreen(
     modifier: Modifier = Modifier
 ) {
 
-    /*
-     * ============================================================
-     * ROUTING STATE
-     * ============================================================
-     */
-
     val routingState by
         audioRoutingManager
             .routingState
@@ -82,12 +64,6 @@ fun HomeScreen(
         audioRoutingManager
             .availableDevices
             .collectAsState()
-
-    /*
-     * ============================================================
-     * CONTEXT
-     * ============================================================
-     */
 
     val context =
         LocalContext
@@ -99,7 +75,7 @@ fun HomeScreen(
 
     /*
      * ============================================================
-     * LIVE GATT SCAN STATE
+     * LIVE SCAN
      * ============================================================
      */
 
@@ -137,7 +113,7 @@ fun HomeScreen(
 
     /*
      * ============================================================
-     * CACHE / CONNECTION STATE
+     * CACHE + CONNECT
      * ============================================================
      */
 
@@ -156,12 +132,6 @@ fun HomeScreen(
                 null
             )
         }
-
-    /*
-     * ============================================================
-     * SCREEN
-     * ============================================================
-     */
 
     Scaffold(
         modifier =
@@ -247,7 +217,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * AUDIO ROUTING STATUS
+             * ROUTING STATUS
              * ====================================================
              */
 
@@ -281,7 +251,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * BLUETOOTH DEVICES
+             * DEVICES
              * ====================================================
              */
 
@@ -301,7 +271,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * SHIZUKU STATUS
+             * SHIZUKU
              * ====================================================
              */
 
@@ -365,13 +335,10 @@ fun HomeScreen(
 
                     scanResult =
                         """
-                        Running safe live LE GATT scan...
+                        Running live LE GATT scan...
 
                         Device:
                         $preferredName
-
-                        HFP/A2DP profile policies are
-                        not being changed.
                         """.trimIndent()
 
                     coroutineScope.launch {
@@ -407,7 +374,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * CACHE REFRESH + LE CONNECTION
+             * REFRESH + CONNECT
              * ====================================================
              */
 
@@ -419,12 +386,6 @@ fun HomeScreen(
                     cacheResult,
 
                 onRun = cache@{
-
-                    /*
-                     * ------------------------------------------------
-                     * SHIZUKU MUST BE READY
-                     * ------------------------------------------------
-                     */
 
                     if (
                         !shizukuManager
@@ -441,12 +402,6 @@ fun HomeScreen(
 
                         return@cache
                     }
-
-                    /*
-                     * ------------------------------------------------
-                     * FIND CONNECTED BUDS
-                     * ------------------------------------------------
-                     */
 
                     val buds =
                         findBudsAudioDevice(
@@ -478,23 +433,20 @@ fun HomeScreen(
                         """
                         STEP 1 OF 4
 
-                        Verifying live LE Audio
-                        services on the Buds...
-
-                        Device:
-                        $preferredName
+                        Verifying the Buds'
+                        live LE Audio services...
                         """.trimIndent()
 
                     coroutineScope.launch {
 
                         /*
-                         * ============================================
+                         * ==========================================
                          * STEP 1
-                         * LIVE GATT VALIDATION
-                         * ============================================
+                         * LIVE GATT
+                         * ==========================================
                          */
 
-                        val liveResult =
+                        val live =
                             withContext(
                                 Dispatchers.IO
                             ) {
@@ -508,59 +460,41 @@ fun HomeScreen(
                                 )
                             }
 
-                        /*
-                         * Update the quick scan display too.
-                         */
-
                         ascsFound =
-                            liveResult.hasAscs
+                            live.hasAscs
 
                         pacsFound =
-                            liveResult.hasPacs
+                            live.hasPacs
 
                         scanResult =
-                            liveResult.text
+                            live.text
 
                         /*
-                         * STOP if the core LE Audio services are not
-                         * actually visible right now.
+                         * Live scan should still confirm both
+                         * core services actually exist on the Buds.
+                         *
+                         * This is different from Android's cache.
                          */
-
                         if (
-                            !liveResult.success ||
-                            !liveResult.hasAscs ||
-                            !liveResult.hasPacs
+                            !live.success ||
+                            !live.hasAscs ||
+                            !live.hasPacs
                         ) {
 
                             cacheResult =
                                 """
                                 STOPPED SAFELY
 
-                                The live Buds service scan did not
-                                confirm both required LE Audio services.
+                                Live GATT did not confirm
+                                both LE Audio services.
 
                                 ASCS 0x184E:
-                                ${
-                                    if (liveResult.hasAscs) {
-                                        "YES"
-                                    } else {
-                                        "NO"
-                                    }
-                                }
+                                ${yesNo(live.hasAscs)}
 
                                 PACS 0x1850:
-                                ${
-                                    if (liveResult.hasPacs) {
-                                        "YES"
-                                    } else {
-                                        "NO"
-                                    }
-                                }
+                                ${yesNo(live.hasPacs)}
 
-                                No Android UUID-cache refresh
-                                was attempted.
-
-                                No LE Audio profile connection
+                                No LE profile connection
                                 was attempted.
                                 """.trimIndent()
 
@@ -571,24 +505,23 @@ fun HomeScreen(
                         }
 
                         /*
-                         * ============================================
+                         * ==========================================
                          * STEP 2
-                         * REFRESH ANDROID'S OWN LE UUID CACHE
-                         * ============================================
+                         * ANDROID CACHE
+                         * ==========================================
                          */
 
                         cacheResult =
                             """
                             STEP 2 OF 4
 
-                            Live Buds LE Audio services:
+                            Live services confirmed:
 
                             ASCS 0x184E: YES
                             PACS 0x1850: YES
 
-                            Asking Android's own Bluetooth stack
-                            to refresh UUIDs specifically over
-                            TRANSPORT_LE through Shizuku...
+                            Checking / refreshing Android's
+                            LE Audio UUID cache...
                             """.trimIndent()
 
                         val refresh =
@@ -606,14 +539,25 @@ fun HomeScreen(
                             }
 
                         /*
-                         * If Android did not update its cache,
-                         * DO NOT attempt LE profile connection.
+                         * =================================================
+                         * IMPORTANT CORRECTION
+                         * =================================================
+                         *
+                         * OLD GATE:
+                         *
+                         * require ASCS && PACS
+                         *
+                         * NEW CORRECT GATE:
+                         *
+                         * require ASCS 0x184E
+                         *
+                         * AOSP LeAudioService.connect() checks
+                         * BluetoothUuid.LE_AUDIO / 184E.
                          */
 
                         if (
                             !refresh.cacheUpdated ||
-                            !refresh.hasAscs ||
-                            !refresh.hasPacs
+                            !refresh.hasAscs
                         ) {
 
                             cacheResult =
@@ -626,10 +570,10 @@ fun HomeScreen(
                         }
 
                         /*
-                         * ============================================
+                         * ==========================================
                          * STEP 3
-                         * CONNECT LE AUDIO PROFILE
-                         * ============================================
+                         * LE AUDIO CONNECT
+                         * ==========================================
                          */
 
                         cacheResult =
@@ -640,20 +584,18 @@ fun HomeScreen(
 
                                 STEP 3 OF 4
 
-                                Android's cached UUID list now
-                                contains the core LE Audio services.
+                                Android now has:
 
-                                Attempting the LE Audio profile
-                                connection...
+                                ASCS / LE_AUDIO 0x184E = YES
+
+                                PACS cached:
+                                ${yesNo(refresh.hasPacs)}
+
+                                PACS is not required by the
+                                LeAudioService connection gate.
+
+                                Attempting LE Audio connection...
                                 """.trimIndent()
-
-                        /*
-                         * LeAudioShizukuBridge is the safe version
-                         * you already installed.
-                         *
-                         * It checks the cached UUIDs before calling
-                         * BluetoothLeAudio.connect().
-                         */
 
                         val connectResult =
                             withContext(
@@ -671,19 +613,19 @@ fun HomeScreen(
                             }
 
                         /*
-                         * ============================================
-                         * CONNECTION FAILED / INCOMPLETE
-                         * ============================================
+                         * Only continue when the bridge proves
+                         * the profile really reached CONNECTED.
                          */
 
-                        if (
-                            !connectResult.contains(
+                        val connected =
+                            connectResult.contains(
                                 "ACCEPTED - LE AUDIO CONNECTED"
-                            ) &&
-                            !connectResult.contains(
-                                "ACCEPTED - ALREADY CONNECTED"
-                            )
-                        ) {
+                            ) ||
+                                connectResult.contains(
+                                    "ACCEPTED - ALREADY CONNECTED"
+                                )
+
+                        if (!connected) {
 
                             cacheResult =
                                 refresh.text +
@@ -697,10 +639,10 @@ fun HomeScreen(
                         }
 
                         /*
-                         * ============================================
+                         * ==========================================
                          * STEP 4
-                         * WAIT FOR TYPE_BLE_HEADSET
-                         * ============================================
+                         * WAIT FOR BLE HEADSET ROUTE
+                         * ==========================================
                          */
 
                         cacheResult =
@@ -713,23 +655,15 @@ fun HomeScreen(
 
                                 STEP 4 OF 4
 
-                                LE Audio is connected.
+                                LE Audio profile connected.
 
                                 Waiting for Android to expose
                                 TYPE_BLE_HEADSET...
                                 """.trimIndent()
 
                         delay(
-                            2000
+                            2500
                         )
-
-                        /*
-                         * Strict AudioRoutingManager:
-                         *
-                         * It ONLY selects TYPE_BLE_HEADSET.
-                         *
-                         * It does NOT fall back to HFP/SCO.
-                         */
 
                         val routingResult =
                             audioRoutingManager
@@ -743,17 +677,17 @@ fun HomeScreen(
 
 
 
-                                ===== FINAL ROUTING STEP =====
+                                ===== FINAL ROUTING =====
 
                                 $routingResult
 
-                                If the status at the top of
-                                BTMicFix now says:
+                                Look at the status card at
+                                the top of BTMicFix.
 
+                                SUCCESS TARGET:
+
+                                Antonio's Buds4 Pro
                                 BLE Headset / LE Audio
-
-                                then the Buds microphone is using
-                                the LE communication route.
                                 """.trimIndent()
 
                         cacheWorking =
@@ -761,12 +695,6 @@ fun HomeScreen(
                     }
                 }
             )
-
-            /*
-             * ====================================================
-             * INFO
-             * ====================================================
-             */
 
             CurrentExperimentCard()
 
@@ -782,7 +710,7 @@ fun HomeScreen(
 
 /*
  * ================================================================
- * FIND BUDS AUDIO ENDPOINT
+ * FIND CONNECTED BUDS
  * ================================================================
  */
 
@@ -790,11 +718,6 @@ private fun findBudsAudioDevice(
     devices:
         List<AudioRoutingManager.BluetoothAudioDevice>
 ): AudioRoutingManager.BluetoothAudioDevice? {
-
-    /*
-     * Currently Samsung exposes the Buds through HFP/SCO,
-     * so prefer that endpoint for identifying the headset.
-     */
 
     return devices
         .firstOrNull {
@@ -808,13 +731,12 @@ private fun findBudsAudioDevice(
                 it.deviceInfo.type ==
                     AudioDeviceInfo.TYPE_BLE_HEADSET
             }
-        ?: devices
-            .firstOrNull()
+        ?: devices.firstOrNull()
 }
 
 /*
  * ================================================================
- * LIVE GATT CARD
+ * LIVE SCAN CARD
  * ================================================================
  */
 
@@ -891,22 +813,6 @@ private fun LeGattScanCard(
                         FontWeight.Bold
                 )
             }
-
-            Text(
-                text =
-                    "Safely checks which LE Audio GATT " +
-                        "services the Buds are exposing.",
-
-                style =
-                    MaterialTheme
-                        .typography
-                        .bodySmall,
-
-                color =
-                    MaterialTheme
-                        .colorScheme
-                        .onSurfaceVariant
-            )
 
             if (
                 ascsFound != null ||
@@ -1012,11 +918,8 @@ private fun LeGattScanCard(
 
                 Text(
                     if (scanning) {
-
                         "Scanning…"
-
                     } else {
-
                         "Scan Buds LE Services"
                     }
                 )
@@ -1044,7 +947,7 @@ private fun LeGattScanCard(
 
 /*
  * ================================================================
- * CACHE REFRESH + LE CONNECT CARD
+ * CACHE + CONNECT CARD
  * ================================================================
  */
 
@@ -1122,10 +1025,9 @@ private fun CacheConnectCard(
 
             Text(
                 text =
-                    "Verifies the live Buds services, refreshes " +
-                        "Android's LE UUID cache through Shizuku, " +
-                        "then connects LE Audio only if the cache " +
-                        "was fixed successfully.",
+                    "Requires Android's cached LE_AUDIO " +
+                        "UUID 0x184E. PACS 0x1850 is " +
+                        "diagnostic only.",
 
                 style =
                     MaterialTheme
@@ -1196,12 +1098,9 @@ private fun CacheConnectCard(
 
                 Text(
                     if (working) {
-
                         "Working…"
-
                     } else {
-
-                        "Refresh LE Cache + Connect"
+                        "Connect Buds with LE Audio"
                     }
                 )
             }
@@ -1228,7 +1127,7 @@ private fun CacheConnectCard(
 
 /*
  * ================================================================
- * ROUTING CONTROL
+ * ROUTING BUTTON
  * ================================================================
  */
 
@@ -1240,9 +1139,7 @@ private fun RoutingControlButton(
     onRetry: () -> Unit
 ) {
 
-    when (
-        routingState
-    ) {
+    when (routingState) {
 
         is RoutingState.Idle -> {
 
@@ -1256,11 +1153,6 @@ private fun RoutingControlButton(
                         .height(
                             56.dp
                         ),
-
-                shape =
-                    RoundedCornerShape(
-                        16.dp
-                    ),
 
                 colors =
                     ButtonDefaults.buttonColors(
@@ -1344,21 +1236,6 @@ private fun RoutingControlButton(
                         )
             ) {
 
-                Icon(
-                    imageVector =
-                        Icons.Default.PowerSettingsNew,
-
-                    contentDescription =
-                        null
-                )
-
-                Spacer(
-                    modifier =
-                        Modifier.width(
-                            8.dp
-                        )
-                )
-
                 Text(
                     "Disable Routing"
                 )
@@ -1424,11 +1301,6 @@ private fun CurrentExperimentCard() {
         modifier =
             Modifier.fillMaxWidth(),
 
-        shape =
-            RoundedCornerShape(
-                16.dp
-            ),
-
         colors =
             CardDefaults.cardColors(
                 containerColor =
@@ -1450,7 +1322,7 @@ private fun CurrentExperimentCard() {
 
             Text(
                 text =
-                    "Current experiment",
+                    "Where we are now",
 
                 style =
                     MaterialTheme
@@ -1463,27 +1335,40 @@ private fun CurrentExperimentCard() {
 
             Text(
                 text =
-                    "Your Buds4 Pro already proved they expose:\n\n" +
-                        "ASCS 0x184E = YES\n" +
-                        "PACS 0x1850 = YES\n" +
-                        "BASS 0x184F = YES\n\n" +
-                        "The problem is Android's cached Bluetooth " +
-                        "UUID list did not contain those LE services.\n\n" +
-                        "This build asks Android itself to rediscover " +
-                        "the Buds specifically over TRANSPORT_LE. " +
-                        "It only attempts the LE Audio profile after " +
-                        "the Android cache actually contains 184E + 1850.",
+                    "Live Buds GATT:\n" +
+                        "184E = YES\n" +
+                        "1850 = YES\n" +
+                        "184F = YES\n\n" +
+                        "Android cache after Shizuku refresh:\n" +
+                        "184E = YES\n" +
+                        "184F = YES\n" +
+                        "1850 = not cached\n\n" +
+                        "That is enough to attempt LE Audio " +
+                        "because Android's LeAudioService checks " +
+                        "the LE_AUDIO / 184E UUID.",
 
                 style =
                     MaterialTheme
                         .typography
-                        .bodySmall,
-
-                color =
-                    MaterialTheme
-                        .colorScheme
-                        .onSurfaceVariant
+                        .bodySmall
             )
         }
+    }
+}
+
+/*
+ * ================================================================
+ * YES / NO
+ * ================================================================
+ */
+
+private fun yesNo(
+    value: Boolean
+): String {
+
+    return if (value) {
+        "YES"
+    } else {
+        "NO"
     }
 }
