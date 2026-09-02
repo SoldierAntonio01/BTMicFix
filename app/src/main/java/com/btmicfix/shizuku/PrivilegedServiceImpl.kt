@@ -2,6 +2,7 @@ package com.btmicfix.shizuku
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import androidx.annotation.Keep
@@ -13,32 +14,30 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Shizuku UserService.
+ * Privileged Shizuku UserService.
  *
- * Runs as Android shell UID through Shizuku.
+ * Runs as Android shell UID.
  *
- * In addition to the original audio commands, this version can attempt
- * to enable the hidden Bluetooth LE Audio profile for a paired headset.
+ * Experimental purpose:
+ * Enable the hidden LE Audio profile for a paired Bluetooth headset.
  */
 class PrivilegedServiceImpl :
     IPrivilegedService.Stub {
 
-    private var serviceContext:
-        Context? = null
+    private var serviceContext: Context? = null
 
-    /**
-     * Required fallback constructor.
+    /*
+     * Shizuku fallback constructor.
      */
     constructor() : super() {
+
         Logger.i(
             "PrivilegedService created without Context"
         )
     }
 
-    /**
-     * Shizuku v13+ should use this constructor.
-     *
-     * The Context is needed by BluetoothAdapter.getProfileProxy().
+    /*
+     * Shizuku v13+ constructor.
      */
     @Keep
     constructor(
@@ -49,7 +48,8 @@ class PrivilegedServiceImpl :
             context
 
         Logger.i(
-            "PrivilegedService created with Shizuku Context"
+            "PrivilegedService received Context: " +
+                context.javaClass.name
         )
     }
 
@@ -57,8 +57,6 @@ class PrivilegedServiceImpl :
 
         /*
          * BluetoothProfile.CONNECTION_POLICY_ALLOWED
-         *
-         * Hidden/system API constant value.
          */
         private const val
             CONNECTION_POLICY_ALLOWED =
@@ -66,15 +64,12 @@ class PrivilegedServiceImpl :
 
         private const val
             LE_AUDIO_WAIT_SECONDS =
-            10L
+            12L
 
         private const val
             CONNECTION_SETTLE_MS =
-            3000L
+            4000L
 
-        /*
-         * Keep shell command execution restricted.
-         */
         private val ALLOWED_PREFIXES =
             listOf(
                 "dumpsys audio",
@@ -85,10 +80,16 @@ class PrivilegedServiceImpl :
             )
     }
 
+    /*
+     * ============================================================
+     * DESTROY
+     * ============================================================
+     */
+
     override fun destroy() {
 
         Logger.i(
-            "PrivilegedService: destroy()"
+            "PrivilegedService destroyed"
         )
 
         System.exit(0)
@@ -110,18 +111,10 @@ class PrivilegedServiceImpl :
             }
         ) {
 
-            Logger.e(
-                "Blocked command: $command"
-            )
-
-            return "ERROR: Command not in allowlist"
+            return "ERROR: Command not allowed"
         }
 
         return try {
-
-            Logger.d(
-                "PrivilegedService command: $command"
-            )
 
             val process =
                 Runtime
@@ -155,20 +148,10 @@ class PrivilegedServiceImpl :
 
             } else {
 
-                Logger.e(
-                    "Command failed " +
-                        "(exit=$exitCode): $error"
-                )
-
                 "ERROR: $error"
             }
 
         } catch (e: Exception) {
-
-            Logger.e(
-                "Command exception",
-                e
-            )
 
             "EXCEPTION: ${e.message}"
         }
@@ -192,11 +175,6 @@ class PrivilegedServiceImpl :
             deviceType !in 0..30
         ) {
 
-            Logger.e(
-                "Invalid strategy=$strategy " +
-                    "deviceType=$deviceType"
-            )
-
             return false
         }
 
@@ -213,12 +191,7 @@ class PrivilegedServiceImpl :
                     "ERROR"
                 )
 
-        } catch (e: Exception) {
-
-            Logger.e(
-                "forceAudioStrategy failed",
-                e
-            )
+        } catch (_: Exception) {
 
             false
         }
@@ -226,20 +199,246 @@ class PrivilegedServiceImpl :
 
     /*
      * ============================================================
-     * FORCE LE AUDIO
+     * BLUETOOTH ADAPTER RESOLUTION
      * ============================================================
      *
-     * THIS IS THE NEW PART.
+     * getDefaultAdapter() returned NULL on your Fold6 while
+     * running inside Shizuku.
      *
-     * We ask Android for the Bluetooth LE Audio profile proxy.
-     *
-     * BluetoothLeAudio.setConnectionPolicy() is not a normal
-     * third-party API, so it is invoked through reflection while
-     * running as Shizuku's shell UID.
-     *
-     * CONNECTION_POLICY_ALLOWED causes Android's Bluetooth stack
-     * to enable/connect the LE Audio profile if Samsung allows it
-     * for this paired device.
+     * This tries multiple methods.
+     */
+
+    private fun resolveBluetoothAdapter(
+        context: Context
+    ): Pair<BluetoothAdapter?, String> {
+
+        val report =
+            StringBuilder()
+
+        /*
+         * METHOD 1
+         *
+         * Official modern Android method.
+         */
+        try {
+
+            val manager =
+                context.getSystemService(
+                    BluetoothManager::class.java
+                )
+
+            if (manager == null) {
+
+                report.appendLine(
+                    "Method 1: BluetoothManager = NULL"
+                )
+
+            } else {
+
+                report.appendLine(
+                    "Method 1: BluetoothManager = OK"
+                )
+
+                val adapter =
+                    manager.adapter
+
+                if (adapter != null) {
+
+                    report.appendLine(
+                        "Method 1: BluetoothAdapter = OK"
+                    )
+
+                    return Pair(
+                        adapter,
+                        report.toString()
+                    )
+
+                } else {
+
+                    report.appendLine(
+                        "Method 1: BluetoothAdapter = NULL"
+                    )
+                }
+            }
+
+        } catch (e: Throwable) {
+
+            report.appendLine(
+                "Method 1 error: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        }
+
+        /*
+         * METHOD 2
+         *
+         * Ask Context by Bluetooth service name.
+         */
+        try {
+
+            val service =
+                context.getSystemService(
+                    Context.BLUETOOTH_SERVICE
+                )
+
+            if (service is BluetoothManager) {
+
+                report.appendLine(
+                    "Method 2: Bluetooth service = BluetoothManager"
+                )
+
+                val adapter =
+                    service.adapter
+
+                if (adapter != null) {
+
+                    report.appendLine(
+                        "Method 2: BluetoothAdapter = OK"
+                    )
+
+                    return Pair(
+                        adapter,
+                        report.toString()
+                    )
+
+                } else {
+
+                    report.appendLine(
+                        "Method 2: BluetoothAdapter = NULL"
+                    )
+                }
+
+            } else {
+
+                report.appendLine(
+                    "Method 2: Bluetooth service = " +
+                        (
+                            service
+                                ?.javaClass
+                                ?.name
+                                ?: "NULL"
+                            )
+                )
+            }
+
+        } catch (e: Throwable) {
+
+            report.appendLine(
+                "Method 2 error: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        }
+
+        /*
+         * METHOD 3
+         *
+         * BluetoothManager's constructor is hidden from regular apps,
+         * but Shizuku UserService does not have normal hidden-API
+         * restrictions.
+         *
+         * Construct BluetoothManager directly using the Shizuku
+         * Context.
+         */
+        try {
+
+            val constructor =
+                BluetoothManager::class.java
+                    .getDeclaredConstructor(
+                        Context::class.java
+                    )
+
+            constructor.isAccessible =
+                true
+
+            val manager =
+                constructor.newInstance(
+                    context
+                )
+
+            report.appendLine(
+                "Method 3: reflected BluetoothManager = OK"
+            )
+
+            val adapter =
+                manager.adapter
+
+            if (adapter != null) {
+
+                report.appendLine(
+                    "Method 3: BluetoothAdapter = OK"
+                )
+
+                return Pair(
+                    adapter,
+                    report.toString()
+                )
+
+            } else {
+
+                report.appendLine(
+                    "Method 3: BluetoothAdapter = NULL"
+                )
+            }
+
+        } catch (e: Throwable) {
+
+            report.appendLine(
+                "Method 3 error: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        }
+
+        /*
+         * METHOD 4
+         *
+         * Old static fallback.
+         *
+         * This is what failed previously, but keep it as the
+         * final fallback.
+         */
+        try {
+
+            @Suppress("DEPRECATION")
+            val adapter =
+                BluetoothAdapter
+                    .getDefaultAdapter()
+
+            if (adapter != null) {
+
+                report.appendLine(
+                    "Method 4: getDefaultAdapter = OK"
+                )
+
+                return Pair(
+                    adapter,
+                    report.toString()
+                )
+
+            } else {
+
+                report.appendLine(
+                    "Method 4: getDefaultAdapter = NULL"
+                )
+            }
+
+        } catch (e: Throwable) {
+
+            report.appendLine(
+                "Method 4 error: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        }
+
+        return Pair(
+            null,
+            report.toString()
+        )
+    }
+
+    /*
+     * ============================================================
+     * FORCE LE AUDIO
+     * ============================================================
      */
 
     override fun forceLeAudio(
@@ -250,9 +449,6 @@ class PrivilegedServiceImpl :
             "Force LE Audio requested for $address"
         )
 
-        /*
-         * Validate the MAC address before doing anything.
-         */
         if (
             !BluetoothAdapter
                 .checkBluetoothAddress(
@@ -261,10 +457,8 @@ class PrivilegedServiceImpl :
         ) {
 
             return buildResult(
-                title =
-                    "FAILED",
-                details =
-                    "Invalid Bluetooth address: $address"
+                "FAILED",
+                "Invalid Bluetooth address:\n$address"
             )
         }
 
@@ -274,36 +468,98 @@ class PrivilegedServiceImpl :
         if (context == null) {
 
             return buildResult(
-                title =
-                    "FAILED",
-                details =
-                    "Shizuku UserService did not receive a Context."
+                "FAILED",
+                """
+                Shizuku UserService has no Context.
+
+                The Context constructor was not used.
+                """.trimIndent()
             )
         }
 
+        /*
+         * ========================================================
+         * NEW ADAPTER RESOLUTION
+         * ========================================================
+         */
+
+        val adapterResult =
+            resolveBluetoothAdapter(
+                context
+            )
+
         val adapter =
-            BluetoothAdapter
-                .getDefaultAdapter()
+            adapterResult.first
+
+        val adapterReport =
+            adapterResult.second
 
         if (adapter == null) {
 
             return buildResult(
-                title =
-                    "FAILED",
-                details =
-                    "BluetoothAdapter is unavailable."
+                "FAILED",
+                """
+                Bluetooth adapter could not be obtained.
+
+                Adapter diagnostic:
+
+                $adapterReport
+                """.trimIndent()
             )
         }
 
-        if (!adapter.isEnabled) {
+        Logger.i(
+            "Bluetooth adapter resolved:\n" +
+                adapterReport
+        )
+
+        /*
+         * ========================================================
+         * BLUETOOTH STATE
+         * ========================================================
+         */
+
+        val enabled =
+            try {
+
+                adapter.isEnabled
+
+            } catch (e: Throwable) {
+
+                return buildResult(
+                    "FAILED",
+                    """
+                    Bluetooth adapter exists,
+                    but Android blocked isEnabled().
+
+                    ${e.javaClass.name}
+                    ${e.message}
+
+                    Adapter diagnostic:
+                    $adapterReport
+                    """.trimIndent()
+                )
+            }
+
+        if (!enabled) {
 
             return buildResult(
-                title =
-                    "FAILED",
-                details =
-                    "Bluetooth is currently OFF."
+                "FAILED",
+                """
+                Bluetooth adapter found,
+                but Bluetooth reports OFF.
+
+                Adapter diagnostic:
+                $adapterReport
+                """.trimIndent()
             )
         }
+
+        /*
+         * ========================================================
+         * GET BUDS DEVICE
+         * ========================================================
+         */
 
         val device =
             try {
@@ -312,22 +568,25 @@ class PrivilegedServiceImpl :
                     address
                 )
 
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
 
                 return buildResult(
-                    title =
-                        "FAILED",
-                    details =
-                        "Could not create BluetoothDevice.\n" +
-                            "${e.javaClass.simpleName}: ${e.message}"
+                    "FAILED",
+                    """
+                    Bluetooth adapter works,
+                    but getRemoteDevice failed.
+
+                    ${e.javaClass.name}
+                    ${e.message}
+
+                    Adapter diagnostic:
+                    $adapterReport
+                    """.trimIndent()
                 )
             }
 
-        /*
-         * Result from the asynchronous Bluetooth profile callback.
-         */
         val result =
-            AtomicReference<String>(
+            AtomicReference<String?>(
                 null
             )
 
@@ -340,6 +599,12 @@ class PrivilegedServiceImpl :
             CountDownLatch(
                 1
             )
+
+        /*
+         * ========================================================
+         * LE AUDIO PROFILE CALLBACK
+         * ========================================================
+         */
 
         val listener =
             object :
@@ -357,11 +622,16 @@ class PrivilegedServiceImpl :
 
                         result.set(
                             buildResult(
-                                title =
-                                    "FAILED",
-                                details =
-                                    "Android returned unexpected " +
-                                        "Bluetooth profile $profile."
+                                "FAILED",
+                                """
+                                Android returned the wrong profile.
+
+                                Expected:
+                                LE_AUDIO
+
+                                Received:
+                                $profile
+                                """.trimIndent()
                             )
                         )
 
@@ -382,10 +652,14 @@ class PrivilegedServiceImpl :
                                 device.name
                                     ?: "Unknown Bluetooth Device"
 
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
 
                                 "Bluetooth Device"
                             }
+
+                        /*
+                         * Existing LE Audio state.
+                         */
 
                         val oldState =
                             try {
@@ -394,7 +668,7 @@ class PrivilegedServiceImpl :
                                     device
                                 )
 
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
 
                                 -1
                             }
@@ -405,15 +679,19 @@ class PrivilegedServiceImpl :
                                 device
                             )
 
+                        Logger.i(
+                            "LE Audio proxy connected. " +
+                                "Old policy=$oldPolicy, " +
+                                "state=${connectionStateName(oldState)}"
+                        )
+
                         /*
-                         * Hidden method:
-                         *
-                         * BluetoothLeAudio.setConnectionPolicy(
-                         *     BluetoothDevice,
-                         *     CONNECTION_POLICY_ALLOWED
-                         * )
+                         * =================================================
+                         * ENABLE LE AUDIO
+                         * =================================================
                          */
-                        val accepted =
+
+                        val policyAccepted =
                             setLeAudioConnectionPolicy(
                                 proxy,
                                 device,
@@ -421,28 +699,41 @@ class PrivilegedServiceImpl :
                             )
 
                         Logger.i(
-                            "LE Audio setConnectionPolicy returned $accepted"
+                            "setConnectionPolicy(ALLOWED) = " +
+                                policyAccepted
                         )
 
-                        if (!accepted) {
+                        if (!policyAccepted) {
 
                             result.set(
                                 buildResult(
-                                    title =
-                                        "REJECTED",
-                                    details =
-                                        """
-                                        Device: $deviceName
-                                        Address: $address
-                                        LE profile proxy: YES
-                                        Previous policy: $oldPolicy
-                                        Previous state: ${connectionStateName(oldState)}
+                                    "REJECTED",
+                                    """
+                                    We successfully reached
+                                    Android's LE Audio service.
 
-                                        Samsung/Android returned FALSE from
-                                        setConnectionPolicy(ALLOWED).
+                                    Device:
+                                    $deviceName
 
-                                        LE Audio was NOT enabled.
-                                        """.trimIndent()
+                                    Address:
+                                    $address
+
+                                    Previous LE policy:
+                                    $oldPolicy
+
+                                    Previous LE state:
+                                    ${connectionStateName(oldState)}
+
+                                    Android returned FALSE from:
+
+                                    setConnectionPolicy(
+                                        device,
+                                        ALLOWED
+                                    )
+
+                                    Adapter diagnostic:
+                                    $adapterReport
+                                    """.trimIndent()
                                 )
                             )
 
@@ -452,9 +743,10 @@ class PrivilegedServiceImpl :
                         }
 
                         /*
-                         * Give the Bluetooth stack a few seconds to
-                         * establish the LE Audio connection.
+                         * Give Samsung's Bluetooth stack time to start
+                         * the LE Audio connection.
                          */
+
                         try {
 
                             Thread.sleep(
@@ -471,7 +763,7 @@ class PrivilegedServiceImpl :
                                     device
                                 )
 
-                            } catch (_: Exception) {
+                            } catch (_: Throwable) {
 
                                 -1
                             }
@@ -485,33 +777,47 @@ class PrivilegedServiceImpl :
                         val connectedDevices =
                             try {
 
-                                proxy
-                                    .connectedDevices
-                                    .joinToString(
+                                val devices =
+                                    proxy.connectedDevices
+
+                                if (devices.isEmpty()) {
+
+                                    "NONE"
+
+                                } else {
+
+                                    devices.joinToString(
                                         separator = "\n"
                                     ) { connected ->
 
                                         val name =
                                             try {
+
                                                 connected.name
                                                     ?: "LE Device"
-                                            } catch (_: Exception) {
+
+                                            } catch (_: Throwable) {
+
                                                 "LE Device"
                                             }
 
                                         val addr =
                                             try {
+
                                                 connected.address
-                                            } catch (_: Exception) {
+
+                                            } catch (_: Throwable) {
+
                                                 "UNKNOWN"
                                             }
 
                                         "$name [$addr]"
                                     }
+                                }
 
-                            } catch (e: Exception) {
+                            } catch (e: Throwable) {
 
-                                "Unable to read: ${e.message}"
+                                "ERROR: ${e.message}"
                             }
 
                         if (
@@ -521,57 +827,78 @@ class PrivilegedServiceImpl :
 
                             result.set(
                                 buildResult(
-                                    title =
-                                        "SUCCESS",
-                                    details =
-                                        """
-                                        LE AUDIO CONNECTED.
+                                    "SUCCESS",
+                                    """
+                                    LE AUDIO CONNECTED!
 
-                                        Device: $deviceName
-                                        Address: $address
+                                    Device:
+                                    $deviceName
 
-                                        Old policy: $oldPolicy
-                                        New policy: $newPolicy
+                                    Address:
+                                    $address
 
-                                        Old state: ${connectionStateName(oldState)}
-                                        New state: ${connectionStateName(newState)}
+                                    Old policy:
+                                    $oldPolicy
 
-                                        LE connected devices:
-                                        $connectedDevices
+                                    New policy:
+                                    $newPolicy
 
-                                        Now return to BTMicFix and press Retry.
-                                        """.trimIndent()
+                                    Old state:
+                                    ${connectionStateName(oldState)}
+
+                                    New state:
+                                    ${connectionStateName(newState)}
+
+                                    LE Audio connected devices:
+                                    $connectedDevices
+
+                                    Adapter:
+                                    $adapterReport
+
+                                    Now press Retry in BTMicFix.
+                                    """.trimIndent()
                                 )
                             )
 
                         } else {
 
+                            /*
+                             * Policy was accepted, but Samsung may still
+                             * be negotiating the actual connection.
+                             */
+
                             result.set(
                                 buildResult(
-                                    title =
-                                        "ACCEPTED",
-                                    details =
-                                        """
-                                        Android accepted
-                                        setConnectionPolicy(ALLOWED).
+                                    "ACCEPTED",
+                                    """
+                                    Android ACCEPTED the LE Audio policy.
 
-                                        Device: $deviceName
-                                        Address: $address
+                                    Device:
+                                    $deviceName
 
-                                        Old policy: $oldPolicy
-                                        New policy: $newPolicy
+                                    Address:
+                                    $address
 
-                                        Old state: ${connectionStateName(oldState)}
-                                        Current state: ${connectionStateName(newState)}
+                                    Old policy:
+                                    $oldPolicy
 
-                                        LE connected devices:
-                                        $connectedDevices
+                                    New policy:
+                                    $newPolicy
 
-                                        The connection may still be starting.
+                                    Old state:
+                                    ${connectionStateName(oldState)}
 
-                                        Wait about 5 seconds, then press Retry
-                                        in BTMicFix.
-                                        """.trimIndent()
+                                    Current state:
+                                    ${connectionStateName(newState)}
+
+                                    LE Audio devices:
+                                    $connectedDevices
+
+                                    Adapter:
+                                    $adapterReport
+
+                                    Wait 5 seconds and press Retry.
+                                    """.trimIndent()
                                 )
                             )
                         }
@@ -586,16 +913,17 @@ class PrivilegedServiceImpl :
 
                         result.set(
                             buildResult(
-                                title =
-                                    "FAILED",
-                                details =
-                                    """
-                                    Hidden LE Audio API threw an exception.
+                                "FAILED",
+                                """
+                                LE Audio API threw:
 
-                                    ${realError.javaClass.name}
+                                ${realError.javaClass.name}
 
-                                    ${realError.message}
-                                    """.trimIndent()
+                                ${realError.message}
+
+                                Adapter:
+                                $adapterReport
+                                """.trimIndent()
                             )
                         )
 
@@ -605,19 +933,18 @@ class PrivilegedServiceImpl :
 
                         result.set(
                             buildResult(
-                                title =
-                                    "PERMISSION DENIED",
-                                details =
-                                    """
-                                    Android denied the LE Audio privileged call.
+                                "PERMISSION DENIED",
+                                """
+                                We reached Bluetooth LE Audio,
+                                but Android denied the privileged operation.
 
-                                    ${e.javaClass.name}
+                                ${e.javaClass.name}
 
-                                    ${e.message}
+                                ${e.message}
 
-                                    Shizuku is running, but Samsung may have
-                                    added another permission or UID check.
-                                    """.trimIndent()
+                                Adapter:
+                                $adapterReport
+                                """.trimIndent()
                             )
                         )
 
@@ -627,14 +954,15 @@ class PrivilegedServiceImpl :
 
                         result.set(
                             buildResult(
-                                title =
-                                    "FAILED",
-                                details =
-                                    """
-                                    ${e.javaClass.name}
+                                "FAILED",
+                                """
+                                ${e.javaClass.name}
 
-                                    ${e.message}
-                                    """.trimIndent()
+                                ${e.message}
+
+                                Adapter:
+                                $adapterReport
+                                """.trimIndent()
                             )
                         )
 
@@ -654,10 +982,13 @@ class PrivilegedServiceImpl :
 
                         result.set(
                             buildResult(
-                                title =
-                                    "FAILED",
-                                details =
-                                    "LE Audio profile service disconnected."
+                                "FAILED",
+                                """
+                                LE Audio profile service disconnected.
+
+                                Profile:
+                                $profile
+                                """.trimIndent()
                             )
                         )
                     }
@@ -665,6 +996,12 @@ class PrivilegedServiceImpl :
                     latch.countDown()
                 }
             }
+
+        /*
+         * ========================================================
+         * REQUEST LE AUDIO PROFILE PROXY
+         * ========================================================
+         */
 
         val requestStarted =
             try {
@@ -675,57 +1012,72 @@ class PrivilegedServiceImpl :
                     BluetoothProfile.LE_AUDIO
                 )
 
-            } catch (
-                e: SecurityException
-            ) {
+            } catch (e: SecurityException) {
 
                 return buildResult(
-                    title =
-                        "PERMISSION DENIED",
-                    details =
-                        """
-                        Android blocked getProfileProxy(LE_AUDIO).
+                    "PERMISSION DENIED",
+                    """
+                    Bluetooth adapter works.
 
-                        ${e.message}
-                        """.trimIndent()
+                    But Android blocked:
+
+                    getProfileProxy(LE_AUDIO)
+
+                    ${e.javaClass.name}
+
+                    ${e.message}
+
+                    Adapter:
+                    $adapterReport
+                    """.trimIndent()
                 )
 
-            } catch (
-                e: Throwable
-            ) {
+            } catch (e: Throwable) {
 
                 return buildResult(
-                    title =
-                        "FAILED",
-                    details =
-                        """
-                        Could not request LE Audio profile.
+                    "FAILED",
+                    """
+                    Bluetooth adapter works.
 
-                        ${e.javaClass.name}
-                        ${e.message}
-                        """.trimIndent()
+                    But LE Audio profile request failed.
+
+                    ${e.javaClass.name}
+
+                    ${e.message}
+
+                    Adapter:
+                    $adapterReport
+                    """.trimIndent()
                 )
             }
 
         if (!requestStarted) {
 
             return buildResult(
-                title =
-                    "FAILED",
-                details =
-                    """
-                    BluetoothAdapter.getProfileProxy()
-                    returned FALSE for LE_AUDIO.
+                "FAILED",
+                """
+                Bluetooth adapter works.
 
-                    The Fold6 reports LE Audio hardware support,
-                    but Samsung did not provide an LE Audio profile proxy.
-                    """.trimIndent()
+                But:
+
+                getProfileProxy(
+                    LE_AUDIO
+                )
+
+                returned FALSE.
+
+                Adapter:
+                $adapterReport
+                """.trimIndent()
             )
         }
 
         /*
-         * Wait for BluetoothProfile.ServiceListener.
+         * ========================================================
+         * WAIT FOR PROFILE CALLBACK
+         * ========================================================
          */
+
         val callbackReceived =
             try {
 
@@ -744,32 +1096,33 @@ class PrivilegedServiceImpl :
 
                 result.get()
                     ?: buildResult(
-                        title =
-                            "FAILED",
-                        details =
-                            "LE Audio callback returned no result."
+                        "FAILED",
+                        "LE Audio callback returned no result."
                     )
 
             } else {
 
                 buildResult(
-                    title =
-                        "TIMEOUT",
-                    details =
-                        """
-                        Android never delivered the LE Audio
-                        profile callback within $LE_AUDIO_WAIT_SECONDS seconds.
+                    "TIMEOUT",
+                    """
+                    Bluetooth adapter works and Android accepted
+                    the LE Audio profile-proxy request.
 
-                        This usually means Samsung is not exposing the
-                        LE Audio profile to the shell process.
-                        """.trimIndent()
+                    However, the LE Audio callback never arrived
+                    within $LE_AUDIO_WAIT_SECONDS seconds.
+
+                    Adapter:
+                    $adapterReport
+                    """.trimIndent()
                 )
             }
 
         /*
-         * Closing our proxy does NOT disable the Bluetooth profile.
-         * It only releases this app's proxy object.
+         * Release our proxy.
+         *
+         * This does NOT disable LE Audio.
          */
+
         proxyReference
             .get()
             ?.let { proxy ->
@@ -781,12 +1134,12 @@ class PrivilegedServiceImpl :
                         proxy
                     )
 
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                 }
             }
 
         Logger.i(
-            "Force LE Audio result:\n$finalResult"
+            finalResult
         )
 
         return finalResult
@@ -794,7 +1147,7 @@ class PrivilegedServiceImpl :
 
     /*
      * ============================================================
-     * HIDDEN API REFLECTION
+     * HIDDEN LE AUDIO METHODS
      * ============================================================
      */
 
@@ -803,14 +1156,6 @@ class PrivilegedServiceImpl :
         device: BluetoothDevice,
         policy: Int
     ): Boolean {
-
-        /*
-         * Runtime class should be android.bluetooth.BluetoothLeAudio.
-         *
-         * We deliberately use reflection because setConnectionPolicy()
-         * is a privileged/system method on the Android versions we are
-         * targeting.
-         */
 
         val method =
             proxy
@@ -911,13 +1256,17 @@ class PrivilegedServiceImpl :
                 e.targetException
                     ?: e
 
-            "ERROR: ${cause.javaClass.simpleName}: ${cause.message}"
+            "ERROR: " +
+                "${cause.javaClass.simpleName}: " +
+                "${cause.message}"
 
         } catch (
             e: Throwable
         ) {
 
-            "ERROR: ${e.javaClass.simpleName}: ${e.message}"
+            "ERROR: " +
+                "${e.javaClass.simpleName}: " +
+                "${e.message}"
         }
     }
 
