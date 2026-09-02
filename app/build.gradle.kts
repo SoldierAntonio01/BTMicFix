@@ -55,7 +55,6 @@ android {
 
 dependencies {
 
-    // Compose
     val composeBom =
         platform(
             "androidx.compose:compose-bom:2024.02.00"
@@ -83,7 +82,6 @@ dependencies {
         "androidx.compose.material:material-icons-extended"
     )
 
-    // Activity + Lifecycle
     implementation(
         "androidx.activity:activity-compose:1.8.2"
     )
@@ -96,12 +94,13 @@ dependencies {
         "androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0"
     )
 
-    // Core
     implementation(
         "androidx.core:core-ktx:1.12.0"
     )
 
-    // Shizuku
+    /*
+     * SHIZUKU
+     */
     val shizukuVersion =
         "13.1.5"
 
@@ -113,21 +112,30 @@ dependencies {
         "dev.rikka.shizuku:provider:$shizukuVersion"
     )
 
-    // Hidden Android API access.
-    //
-    // We still use Shizuku for the privileged Binder call.
-    // This library only lets BTMicFix reach the hidden
-    // Bluetooth framework interface needed to obtain that Binder.
+    /*
+     * REQUIRED BY LeAudioShizukuBridge.kt
+     *
+     * Without this dependency,
+     * imports such as:
+     *
+     * org.lsposed.hiddenapibypass.HiddenApiBypass
+     *
+     * will fail to compile.
+     */
     implementation(
         "org.lsposed.hiddenapibypass:hiddenapibypass:6.1"
     )
 
-    // Coroutines
+    /*
+     * COROUTINES
+     */
     implementation(
         "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
     )
 
-    // Tests
+    /*
+     * TESTS
+     */
     testImplementation(
         "junit:junit:4.13.2"
     )
