@@ -34,15 +34,28 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * BTMicFix LE Audio activation screen.
+ * Lightweight BTMicFix LE Audio screen.
  *
- * IMPORTANT:
+ * Important performance changes:
  *
- * Android's LE Audio connection gate requires the cached
- * BluetoothUuid.LE_AUDIO / ASCS UUID 0x184E.
+ * - Giant UUID dumps are collapsed by default.
+ * - Successful setup does not keep repainting huge diagnostic text.
+ * - "Connect Buds with LE Audio" no longer runs the full live GATT
+ *   scan every time.
  *
- * PACS 0x1850 is useful diagnostic information but is NOT
- * required in BluetoothDevice.getUuids() before connecting.
+ * We already proved the Buds expose:
+ *
+ * ASCS 0x184E = YES
+ * PACS 0x1850 = YES
+ * BASS 0x184F = YES
+ *
+ * Therefore normal connection attempts can go:
+ *
+ * cache check/refresh
+ *      ↓
+ * LE Audio connect
+ *      ↓
+ * BLE communication route
  */
 @OptIn(
     ExperimentalMaterial3Api::class
@@ -75,7 +88,7 @@ fun HomeScreen(
 
     /*
      * ============================================================
-     * LIVE SCAN
+     * LIVE SCAN STATE
      * ============================================================
      */
 
@@ -87,7 +100,23 @@ fun HomeScreen(
             )
         }
 
-    var scanResult by
+    var scanAscs by
+        remember {
+
+            mutableStateOf<Boolean?>(
+                null
+            )
+        }
+
+    var scanPacs by
+        remember {
+
+            mutableStateOf<Boolean?>(
+                null
+            )
+        }
+
+    var scanDetails by
         remember {
 
             mutableStateOf<String?>(
@@ -95,29 +124,7 @@ fun HomeScreen(
             )
         }
 
-    var ascsFound by
-        remember {
-
-            mutableStateOf<Boolean?>(
-                null
-            )
-        }
-
-    var pacsFound by
-        remember {
-
-            mutableStateOf<Boolean?>(
-                null
-            )
-        }
-
-    /*
-     * ============================================================
-     * CACHE + CONNECT
-     * ============================================================
-     */
-
-    var cacheWorking by
+    var showScanDetails by
         remember {
 
             mutableStateOf(
@@ -125,11 +132,41 @@ fun HomeScreen(
             )
         }
 
-    var cacheResult by
+    /*
+     * ============================================================
+     * CONNECT STATE
+     * ============================================================
+     */
+
+    var connecting by
+        remember {
+
+            mutableStateOf(
+                false
+            )
+        }
+
+    var connectSummary by
         remember {
 
             mutableStateOf<String?>(
                 null
+            )
+        }
+
+    var connectDetails by
+        remember {
+
+            mutableStateOf<String?>(
+                null
+            )
+        }
+
+    var showConnectDetails by
+        remember {
+
+            mutableStateOf(
+                false
             )
         }
 
@@ -282,125 +319,48 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * LIVE GATT SCAN
+             * CONNECT CARD
              * ====================================================
+             *
+             * Put the useful button first now.
              */
 
-            LeGattScanCard(
-                scanning =
-                    scanning,
-
-                result =
-                    scanResult,
-
-                ascsFound =
-                    ascsFound,
-
-                pacsFound =
-                    pacsFound,
-
-                onScan = scan@{
-
-                    val buds =
-                        findBudsAudioDevice(
-                            availableDevices
-                        )
-
-                    if (
-                        buds ==
-                        null
-                    ) {
-
-                        scanResult =
-                            """
-                            No Bluetooth headset found.
-
-                            Connect Antonio's Buds4 Pro first.
-                            """.trimIndent()
-
-                        return@scan
-                    }
-
-                    val preferredName =
-                        buds.name
-
-                    scanning =
-                        true
-
-                    ascsFound =
-                        null
-
-                    pacsFound =
-                        null
-
-                    scanResult =
-                        """
-                        Running live LE GATT scan...
-
-                        Device:
-                        $preferredName
-                        """.trimIndent()
-
-                    coroutineScope.launch {
-
-                        val result =
-                            withContext(
-                                Dispatchers.IO
-                            ) {
-
-                                LeGattScanner.scan(
-                                    context =
-                                        context,
-
-                                    preferredDeviceName =
-                                        preferredName
-                                )
-                            }
-
-                        ascsFound =
-                            result.hasAscs
-
-                        pacsFound =
-                            result.hasPacs
-
-                        scanResult =
-                            result.text
-
-                        scanning =
-                            false
-                    }
-                }
-            )
-
-            /*
-             * ====================================================
-             * REFRESH + CONNECT
-             * ====================================================
-             */
-
-            CacheConnectCard(
+            LightweightConnectCard(
                 working =
-                    cacheWorking,
+                    connecting,
 
-                result =
-                    cacheResult,
+                summary =
+                    connectSummary,
 
-                onRun = cache@{
+                details =
+                    connectDetails,
+
+                showDetails =
+                    showConnectDetails,
+
+                onToggleDetails = {
+
+                    showConnectDetails =
+                        !showConnectDetails
+                },
+
+                onConnect = connect@{
 
                     if (
                         !shizukuManager
                             .isAvailable()
                     ) {
 
-                        cacheResult =
-                            """
-                            Shizuku is not ready.
+                        connectSummary =
+                            "Shizuku is not ready."
 
+                        connectDetails =
+                            """
                             Open Shizuku and make sure
-                            it says Running.
+                            it says Running, then try again.
                             """.trimIndent()
 
-                        return@cache
+                        return@connect
                     }
 
                     val buds =
@@ -413,92 +373,78 @@ fun HomeScreen(
                         null
                     ) {
 
-                        cacheResult =
-                            """
-                            No Bluetooth headset found.
+                        connectSummary =
+                            "No Buds headset found."
 
-                            Connect Antonio's Buds4 Pro first.
+                        connectDetails =
+                            """
+                            Connect Antonio's Buds4 Pro normally
+                            in Bluetooth settings first.
                             """.trimIndent()
 
-                        return@cache
+                        return@connect
                     }
 
                     val preferredName =
                         buds.name
 
-                    cacheWorking =
+                    connecting =
                         true
 
-                    cacheResult =
-                        """
-                        STEP 1 OF 4
+                    showConnectDetails =
+                        false
 
-                        Verifying the Buds'
-                        live LE Audio services...
-                        """.trimIndent()
+                    connectSummary =
+                        "Checking Android LE Audio cache…"
+
+                    connectDetails =
+                        null
 
                     coroutineScope.launch {
 
                         /*
                          * ==========================================
                          * STEP 1
-                         * LIVE GATT
+                         * CACHE CHECK / REFRESH
                          * ==========================================
+                         *
+                         * If 184E is already cached, this returns
+                         * immediately.
+                         *
+                         * We no longer perform another full live
+                         * GATT scan on every connection.
                          */
 
-                        val live =
+                        val refresh =
                             withContext(
                                 Dispatchers.IO
                             ) {
 
-                                LeGattScanner.scan(
-                                    context =
-                                        context,
+                                LeAudioCacheRefresher
+                                    .refresh(
+                                        context =
+                                            context,
 
-                                    preferredDeviceName =
-                                        preferredName
-                                )
+                                        preferredDeviceName =
+                                            preferredName
+                                    )
                             }
 
-                        ascsFound =
-                            live.hasAscs
-
-                        pacsFound =
-                            live.hasPacs
-
-                        scanResult =
-                            live.text
-
-                        /*
-                         * Live scan should still confirm both
-                         * core services actually exist on the Buds.
-                         *
-                         * This is different from Android's cache.
-                         */
                         if (
-                            !live.success ||
-                            !live.hasAscs ||
-                            !live.hasPacs
+                            !refresh.cacheUpdated ||
+                            !refresh.hasAscs
                         ) {
 
-                            cacheResult =
-                                """
-                                STOPPED SAFELY
+                            connectSummary =
+                                "Android LE Audio cache is not ready."
 
-                                Live GATT did not confirm
-                                both LE Audio services.
+                            connectDetails =
+                                refresh.text
 
-                                ASCS 0x184E:
-                                ${yesNo(live.hasAscs)}
+                            showConnectDetails =
+                                true
 
-                                PACS 0x1850:
-                                ${yesNo(live.hasPacs)}
-
-                                No LE profile connection
-                                was attempted.
-                                """.trimIndent()
-
-                            cacheWorking =
+                            connecting =
                                 false
 
                             return@launch
@@ -507,95 +453,12 @@ fun HomeScreen(
                         /*
                          * ==========================================
                          * STEP 2
-                         * ANDROID CACHE
+                         * LE AUDIO PROFILE
                          * ==========================================
                          */
 
-                        cacheResult =
-                            """
-                            STEP 2 OF 4
-
-                            Live services confirmed:
-
-                            ASCS 0x184E: YES
-                            PACS 0x1850: YES
-
-                            Checking / refreshing Android's
-                            LE Audio UUID cache...
-                            """.trimIndent()
-
-                        val refresh =
-                            withContext(
-                                Dispatchers.IO
-                            ) {
-
-                                LeAudioCacheRefresher.refresh(
-                                    context =
-                                        context,
-
-                                    preferredDeviceName =
-                                        preferredName
-                                )
-                            }
-
-                        /*
-                         * =================================================
-                         * IMPORTANT CORRECTION
-                         * =================================================
-                         *
-                         * OLD GATE:
-                         *
-                         * require ASCS && PACS
-                         *
-                         * NEW CORRECT GATE:
-                         *
-                         * require ASCS 0x184E
-                         *
-                         * AOSP LeAudioService.connect() checks
-                         * BluetoothUuid.LE_AUDIO / 184E.
-                         */
-
-                        if (
-                            !refresh.cacheUpdated ||
-                            !refresh.hasAscs
-                        ) {
-
-                            cacheResult =
-                                refresh.text
-
-                            cacheWorking =
-                                false
-
-                            return@launch
-                        }
-
-                        /*
-                         * ==========================================
-                         * STEP 3
-                         * LE AUDIO CONNECT
-                         * ==========================================
-                         */
-
-                        cacheResult =
-                            refresh.text +
-                                """
-
-
-
-                                STEP 3 OF 4
-
-                                Android now has:
-
-                                ASCS / LE_AUDIO 0x184E = YES
-
-                                PACS cached:
-                                ${yesNo(refresh.hasPacs)}
-
-                                PACS is not required by the
-                                LeAudioService connection gate.
-
-                                Attempting LE Audio connection...
-                                """.trimIndent()
+                        connectSummary =
+                            "Connecting Buds through LE Audio…"
 
                         val connectResult =
                             withContext(
@@ -612,11 +475,6 @@ fun HomeScreen(
                                     )
                             }
 
-                        /*
-                         * Only continue when the bridge proves
-                         * the profile really reached CONNECTED.
-                         */
-
                         val connected =
                             connectResult.contains(
                                 "ACCEPTED - LE AUDIO CONNECTED"
@@ -627,12 +485,18 @@ fun HomeScreen(
 
                         if (!connected) {
 
-                            cacheResult =
+                            connectSummary =
+                                "LE Audio did not finish connecting."
+
+                            connectDetails =
                                 refresh.text +
                                     "\n\n" +
                                     connectResult
 
-                            cacheWorking =
+                            showConnectDetails =
+                                true
+
+                            connecting =
                                 false
 
                             return@launch
@@ -640,63 +504,184 @@ fun HomeScreen(
 
                         /*
                          * ==========================================
-                         * STEP 4
-                         * WAIT FOR BLE HEADSET ROUTE
+                         * STEP 3
+                         * BLE COMMUNICATION DEVICE
                          * ==========================================
                          */
 
-                        cacheResult =
-                            refresh.text +
-                                "\n\n" +
-                                connectResult +
-                                """
+                        connectSummary =
+                            "LE Audio connected. Activating Buds mic…"
 
-
-
-                                STEP 4 OF 4
-
-                                LE Audio profile connected.
-
-                                Waiting for Android to expose
-                                TYPE_BLE_HEADSET...
-                                """.trimIndent()
+                        /*
+                         * Small settling delay only.
+                         */
 
                         delay(
-                            2500
+                            750
                         )
 
-                        val routingResult =
+                        val routing =
                             audioRoutingManager
                                 .routeToFirstAvailableBluetooth()
 
-                        cacheResult =
-                            refresh.text +
-                                "\n\n" +
-                                connectResult +
-                                """
+                        when (
+                            routing
+                        ) {
 
+                            is RoutingState.Active -> {
 
+                                connectSummary =
+                                    "✓ LE Audio + Buds microphone active"
 
-                                ===== FINAL ROUTING =====
+                                /*
+                                 * Keep details stored but DO NOT render
+                                 * the enormous diagnostic text unless
+                                 * the user explicitly asks for it.
+                                 */
 
-                                $routingResult
+                                connectDetails =
+                                    refresh.text +
+                                        "\n\n" +
+                                        connectResult +
+                                        "\n\n" +
+                                        "FINAL ROUTING:\n" +
+                                        routing.toString()
 
-                                Look at the status card at
-                                the top of BTMicFix.
+                                showConnectDetails =
+                                    false
+                            }
 
-                                SUCCESS TARGET:
+                            is RoutingState.Failed -> {
 
-                                Antonio's Buds4 Pro
-                                BLE Headset / LE Audio
-                                """.trimIndent()
+                                connectSummary =
+                                    "LE Audio connected, but routing failed."
 
-                        cacheWorking =
+                                connectDetails =
+                                    refresh.text +
+                                        "\n\n" +
+                                        connectResult +
+                                        "\n\n" +
+                                        routing.reason
+
+                                showConnectDetails =
+                                    true
+                            }
+
+                            else -> {
+
+                                connectSummary =
+                                    "LE Audio connection finished."
+
+                                connectDetails =
+                                    connectResult
+                            }
+                        }
+
+                        connecting =
                             false
                     }
                 }
             )
 
-            CurrentExperimentCard()
+            /*
+             * ====================================================
+             * OPTIONAL DIAGNOSTIC SCAN
+             * ====================================================
+             */
+
+            CompactGattScanCard(
+                scanning =
+                    scanning,
+
+                ascs =
+                    scanAscs,
+
+                pacs =
+                    scanPacs,
+
+                details =
+                    scanDetails,
+
+                showDetails =
+                    showScanDetails,
+
+                onToggleDetails = {
+
+                    showScanDetails =
+                        !showScanDetails
+                },
+
+                onScan = scan@{
+
+                    val buds =
+                        findBudsAudioDevice(
+                            availableDevices
+                        )
+
+                    if (
+                        buds ==
+                        null
+                    ) {
+
+                        scanDetails =
+                            "Connect the Buds first."
+
+                        showScanDetails =
+                            true
+
+                        return@scan
+                    }
+
+                    scanning =
+                        true
+
+                    scanAscs =
+                        null
+
+                    scanPacs =
+                        null
+
+                    showScanDetails =
+                        false
+
+                    coroutineScope.launch {
+
+                        val result =
+                            withContext(
+                                Dispatchers.IO
+                            ) {
+
+                                LeGattScanner.scan(
+                                    context =
+                                        context,
+
+                                    preferredDeviceName =
+                                        buds.name
+                                )
+                            }
+
+                        scanAscs =
+                            result.hasAscs
+
+                        scanPacs =
+                            result.hasPacs
+
+                        scanDetails =
+                            result.text
+
+                        scanning =
+                            false
+                    }
+                }
+            )
+
+            /*
+             * ====================================================
+             * PERFORMANCE NOTE
+             * ====================================================
+             */
+
+            PerformanceCard()
 
             Spacer(
                 modifier =
@@ -710,7 +695,7 @@ fun HomeScreen(
 
 /*
  * ================================================================
- * FIND CONNECTED BUDS
+ * FIND BUDS
  * ================================================================
  */
 
@@ -719,243 +704,57 @@ private fun findBudsAudioDevice(
         List<AudioRoutingManager.BluetoothAudioDevice>
 ): AudioRoutingManager.BluetoothAudioDevice? {
 
-    return devices
+    /*
+     * If LE already exists, use it.
+     */
+
+    devices
         .firstOrNull {
 
             it.deviceInfo.type ==
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                AudioDeviceInfo
+                    .TYPE_BLE_HEADSET
         }
-        ?: devices
-            .firstOrNull {
+        ?.let {
 
-                it.deviceInfo.type ==
-                    AudioDeviceInfo.TYPE_BLE_HEADSET
-            }
-        ?: devices.firstOrNull()
+            return it
+        }
+
+    /*
+     * Otherwise use HFP only to identify the physical Buds
+     * for the cache / LE profile connection process.
+     */
+
+    devices
+        .firstOrNull {
+
+            it.deviceInfo.type ==
+                AudioDeviceInfo
+                    .TYPE_BLUETOOTH_SCO
+        }
+        ?.let {
+
+            return it
+        }
+
+    return devices
+        .firstOrNull()
 }
 
 /*
  * ================================================================
- * LIVE SCAN CARD
+ * LIGHTWEIGHT CONNECT CARD
  * ================================================================
  */
 
 @Composable
-private fun LeGattScanCard(
-    scanning: Boolean,
-    result: String?,
-    ascsFound: Boolean?,
-    pacsFound: Boolean?,
-    onScan: () -> Unit
-) {
-
-    Card(
-        modifier =
-            Modifier.fillMaxWidth(),
-
-        shape =
-            RoundedCornerShape(
-                16.dp
-            ),
-
-        colors =
-            CardDefaults.cardColors(
-                containerColor =
-                    SurfaceCard
-            )
-    ) {
-
-        Column(
-            modifier =
-                Modifier.padding(
-                    16.dp
-                ),
-
-            verticalArrangement =
-                Arrangement.spacedBy(
-                    12.dp
-                )
-        ) {
-
-            Row(
-                verticalAlignment =
-                    Alignment.CenterVertically
-            ) {
-
-                Icon(
-                    imageVector =
-                        Icons.Default.Search,
-
-                    contentDescription =
-                        null,
-
-                    tint =
-                        Purple80
-                )
-
-                Spacer(
-                    modifier =
-                        Modifier.width(
-                            8.dp
-                        )
-                )
-
-                Text(
-                    text =
-                        "Live Buds LE Service Scan",
-
-                    style =
-                        MaterialTheme
-                            .typography
-                            .titleMedium,
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
-            }
-
-            if (
-                ascsFound != null ||
-                pacsFound != null
-            ) {
-
-                HorizontalDivider()
-
-                Text(
-                    text =
-                        "ASCS 0x184E: " +
-                            when (ascsFound) {
-
-                                true ->
-                                    "YES"
-
-                                false ->
-                                    "NO"
-
-                                null ->
-                                    "UNKNOWN"
-                            },
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
-
-                Text(
-                    text =
-                        "PACS 0x1850: " +
-                            when (pacsFound) {
-
-                                true ->
-                                    "YES"
-
-                                false ->
-                                    "NO"
-
-                                null ->
-                                    "UNKNOWN"
-                            },
-
-                    fontWeight =
-                        FontWeight.Bold
-                )
-            }
-
-            Button(
-                onClick =
-                    onScan,
-
-                enabled =
-                    !scanning,
-
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .height(
-                            56.dp
-                        ),
-
-                shape =
-                    RoundedCornerShape(
-                        16.dp
-                    ),
-
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor =
-                            Purple40
-                    )
-            ) {
-
-                if (scanning) {
-
-                    CircularProgressIndicator(
-                        modifier =
-                            Modifier.size(
-                                20.dp
-                            ),
-
-                        strokeWidth =
-                            2.dp
-                    )
-
-                } else {
-
-                    Icon(
-                        imageVector =
-                            Icons.Default.Search,
-
-                        contentDescription =
-                            null
-                    )
-                }
-
-                Spacer(
-                    modifier =
-                        Modifier.width(
-                            8.dp
-                        )
-                )
-
-                Text(
-                    if (scanning) {
-                        "Scanning…"
-                    } else {
-                        "Scan Buds LE Services"
-                    }
-                )
-            }
-
-            if (
-                result != null
-            ) {
-
-                HorizontalDivider()
-
-                Text(
-                    text =
-                        result,
-
-                    style =
-                        MaterialTheme
-                            .typography
-                            .bodySmall
-                )
-            }
-        }
-    }
-}
-
-/*
- * ================================================================
- * CACHE + CONNECT CARD
- * ================================================================
- */
-
-@Composable
-private fun CacheConnectCard(
+private fun LightweightConnectCard(
     working: Boolean,
-    result: String?,
-    onRun: () -> Unit
+    summary: String?,
+    details: String?,
+    showDetails: Boolean,
+    onToggleDetails: () -> Unit,
+    onConnect: () -> Unit
 ) {
 
     Card(
@@ -993,7 +792,8 @@ private fun CacheConnectCard(
 
                 Icon(
                     imageVector =
-                        Icons.Default.Refresh,
+                        Icons.Default
+                            .BluetoothAudio,
 
                     contentDescription =
                         null,
@@ -1011,7 +811,7 @@ private fun CacheConnectCard(
 
                 Text(
                     text =
-                        "Android LE Cache + Connection",
+                        "LE Audio + Buds Mic",
 
                     style =
                         MaterialTheme
@@ -1025,9 +825,8 @@ private fun CacheConnectCard(
 
             Text(
                 text =
-                    "Requires Android's cached LE_AUDIO " +
-                        "UUID 0x184E. PACS 0x1850 is " +
-                        "diagnostic only.",
+                    "Uses the LE Audio connection we successfully " +
+                        "proved, without constantly polling Android.",
 
                 style =
                     MaterialTheme
@@ -1042,7 +841,7 @@ private fun CacheConnectCard(
 
             Button(
                 onClick =
-                    onRun,
+                    onConnect,
 
                 enabled =
                     !working,
@@ -1082,7 +881,8 @@ private fun CacheConnectCard(
 
                     Icon(
                         imageVector =
-                            Icons.Default.BluetoothAudio,
+                            Icons.Default
+                                .BluetoothAudio,
 
                         contentDescription =
                             null
@@ -1098,7 +898,7 @@ private fun CacheConnectCard(
 
                 Text(
                     if (working) {
-                        "Working…"
+                        "Connecting…"
                     } else {
                         "Connect Buds with LE Audio"
                     }
@@ -1106,20 +906,59 @@ private fun CacheConnectCard(
             }
 
             if (
-                result != null
+                summary !=
+                null
             ) {
 
                 HorizontalDivider()
 
                 Text(
                     text =
-                        result,
+                        summary,
 
-                    style =
-                        MaterialTheme
-                            .typography
-                            .bodySmall
+                    fontWeight =
+                        FontWeight.Bold
                 )
+            }
+
+            if (
+                details !=
+                null
+            ) {
+
+                TextButton(
+                    onClick =
+                        onToggleDetails
+                ) {
+
+                    Text(
+                        if (showDetails) {
+                            "Hide technical details"
+                        } else {
+                            "Show technical details"
+                        }
+                    )
+                }
+
+                /*
+                 * The large diagnostics are NOT composed unless
+                 * explicitly expanded.
+                 */
+
+                if (
+                    showDetails
+                ) {
+
+                    Text(
+                        text =
+                            details,
+
+                        style =
+                            MaterialTheme
+                                .typography
+                                .bodySmall
+                    )
+                }
             }
         }
     }
@@ -1127,7 +966,166 @@ private fun CacheConnectCard(
 
 /*
  * ================================================================
- * ROUTING BUTTON
+ * COMPACT GATT SCAN
+ * ================================================================
+ */
+
+@Composable
+private fun CompactGattScanCard(
+    scanning: Boolean,
+    ascs: Boolean?,
+    pacs: Boolean?,
+    details: String?,
+    showDetails: Boolean,
+    onToggleDetails: () -> Unit,
+    onScan: () -> Unit
+) {
+
+    Card(
+        modifier =
+            Modifier.fillMaxWidth(),
+
+        shape =
+            RoundedCornerShape(
+                16.dp
+            ),
+
+        colors =
+            CardDefaults.cardColors(
+                containerColor =
+                    SurfaceCard
+            )
+    ) {
+
+        Column(
+            modifier =
+                Modifier.padding(
+                    16.dp
+                ),
+
+            verticalArrangement =
+                Arrangement.spacedBy(
+                    10.dp
+                )
+        ) {
+
+            Text(
+                text =
+                    "Optional LE diagnostic",
+
+                style =
+                    MaterialTheme
+                        .typography
+                        .titleMedium,
+
+                fontWeight =
+                    FontWeight.Bold
+            )
+
+            if (
+                ascs !=
+                null
+            ) {
+
+                Text(
+                    text =
+                        "ASCS 0x184E: " +
+                            yesNo(
+                                ascs
+                            )
+                )
+            }
+
+            if (
+                pacs !=
+                null
+            ) {
+
+                Text(
+                    text =
+                        "PACS 0x1850: " +
+                            yesNo(
+                                pacs
+                            )
+                )
+            }
+
+            OutlinedButton(
+                onClick =
+                    onScan,
+
+                enabled =
+                    !scanning,
+
+                modifier =
+                    Modifier.fillMaxWidth()
+            ) {
+
+                Icon(
+                    imageVector =
+                        Icons.Default.Search,
+
+                    contentDescription =
+                        null
+                )
+
+                Spacer(
+                    modifier =
+                        Modifier.width(
+                            8.dp
+                        )
+                )
+
+                Text(
+                    if (scanning) {
+                        "Scanning…"
+                    } else {
+                        "Run LE Service Scan"
+                    }
+                )
+            }
+
+            if (
+                details !=
+                null
+            ) {
+
+                TextButton(
+                    onClick =
+                        onToggleDetails
+                ) {
+
+                    Text(
+                        if (showDetails) {
+                            "Hide scan details"
+                        } else {
+                            "Show scan details"
+                        }
+                    )
+                }
+
+                if (
+                    showDetails
+                ) {
+
+                    Text(
+                        text =
+                            details,
+
+                        style =
+                            MaterialTheme
+                                .typography
+                                .bodySmall
+                    )
+                }
+            }
+        }
+    }
+}
+
+/*
+ * ================================================================
+ * ROUTING CONTROL
  * ================================================================
  */
 
@@ -1139,7 +1137,9 @@ private fun RoutingControlButton(
     onRetry: () -> Unit
 ) {
 
-    when (routingState) {
+    when (
+        routingState
+    ) {
 
         is RoutingState.Idle -> {
 
@@ -1163,7 +1163,8 @@ private fun RoutingControlButton(
 
                 Icon(
                     imageVector =
-                        Icons.Default.PowerSettingsNew,
+                        Icons.Default
+                            .PowerSettingsNew,
 
                     contentDescription =
                         null
@@ -1177,7 +1178,7 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    "Enable Routing"
+                    "Enable BLE Routing"
                 )
             }
         }
@@ -1236,6 +1237,22 @@ private fun RoutingControlButton(
                         )
             ) {
 
+                Icon(
+                    imageVector =
+                        Icons.Default
+                            .PowerSettingsNew,
+
+                    contentDescription =
+                        null
+                )
+
+                Spacer(
+                    modifier =
+                        Modifier.width(
+                            8.dp
+                        )
+                )
+
                 Text(
                     "Disable Routing"
                 )
@@ -1281,7 +1298,7 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    "Retry"
+                    "Retry BLE Route"
                 )
             }
         }
@@ -1290,12 +1307,12 @@ private fun RoutingControlButton(
 
 /*
  * ================================================================
- * INFO CARD
+ * PERFORMANCE INFO
  * ================================================================
  */
 
 @Composable
-private fun CurrentExperimentCard() {
+private fun PerformanceCard() {
 
     Card(
         modifier =
@@ -1322,7 +1339,7 @@ private fun CurrentExperimentCard() {
 
             Text(
                 text =
-                    "Where we are now",
+                    "Performance mode",
 
                 style =
                     MaterialTheme
@@ -1335,22 +1352,22 @@ private fun CurrentExperimentCard() {
 
             Text(
                 text =
-                    "Live Buds GATT:\n" +
-                        "184E = YES\n" +
-                        "1850 = YES\n" +
-                        "184F = YES\n\n" +
-                        "Android cache after Shizuku refresh:\n" +
-                        "184E = YES\n" +
-                        "184F = YES\n" +
-                        "1850 = not cached\n\n" +
-                        "That is enough to attempt LE Audio " +
-                        "because Android's LeAudioService checks " +
-                        "the LE_AUDIO / 184E UUID.",
+                    "The old 250 ms routing watchdog is removed.\n\n" +
+                        "BTMicFix now waits for Android to report an " +
+                        "actual communication-device change before " +
+                        "attempting one debounced recovery.\n\n" +
+                        "Large Bluetooth diagnostic dumps stay collapsed " +
+                        "unless you open them.",
 
                 style =
                     MaterialTheme
                         .typography
-                        .bodySmall
+                        .bodySmall,
+
+                color =
+                    MaterialTheme
+                        .colorScheme
+                        .onSurfaceVariant
             )
         }
     }
