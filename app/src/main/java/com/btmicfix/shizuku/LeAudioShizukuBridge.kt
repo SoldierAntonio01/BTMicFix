@@ -8,6 +8,8 @@ import android.bluetooth.BluetoothProfile
 import android.content.AttributionSource
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.os.IInterface
@@ -23,23 +25,55 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Experimental LE Audio bridge.
+ * BTMicFix - Safer LE Audio connection experiment.
  *
- * IMPORTANT:
+ * IMPORTANT DIFFERENCE FROM PREVIOUS VERSION:
  *
- * BluetoothManager and BluetoothAdapter run from the NORMAL
- * BTMicFix application process.
+ * We DO NOT call:
  *
- * We find the actual paired BluetoothDevice from bondedDevices,
- * rather than trusting AudioDeviceInfo.address.
+ * setConnectionPolicy(ALLOWED)
  *
- * Only the privileged LE Audio Binder transaction is routed
- * through Shizuku.
+ * anymore.
+ *
+ * Your Buds already reported:
+ *
+ * Policy before = ALLOWED (100)
+ * Policy after  = ALLOWED (100)
+ *
+ * Re-setting the policy was unnecessary and could cause
+ * Android/Samsung to begin an LE Audio handover while the
+ * actual LE connection still failed.
+ *
+ *
+ * NEW FLOW:
+ *
+ * 1. Find the real paired Galaxy Buds device.
+ * 2. Read its cached Bluetooth service UUIDs.
+ * 3. Look specifically for LE Audio UUID 0x184E.
+ *
+ *      If 184E is missing:
+ *          STOP.
+ *          Do NOT change profiles.
+ *          Do NOT disconnect HFP/A2DP.
+ *
+ *      If 184E exists:
+ *          Continue.
+ *
+ * 4. Obtain Android's BluetoothLeAudio profile proxy.
+ * 5. Check current LE connection state.
+ * 6. Explicitly call LE Audio connect().
+ * 7. Wait for actual STATE_CONNECTED.
+ * 8. Confirm TYPE_BLE_HEADSET appears.
+ *
+ * No silent HFP fallback is performed here.
  */
 object LeAudioShizukuBridge {
 
-    private const val CONNECTION_POLICY_ALLOWED =
-        100
+    /*
+     * ============================================================
+     * CONSTANTS
+     * ============================================================
+     */
 
     private const val SHELL_UID =
         2000
@@ -47,8 +81,29 @@ object LeAudioShizukuBridge {
     private const val SHELL_PACKAGE =
         "com.android.shell"
 
-    private const val PROFILE_WAIT_SECONDS =
+    /*
+     * Android BluetoothUuid.LE_AUDIO
+     *
+     * Audio Stream Control Service
+     * Bluetooth Assigned Number 0x184E
+     */
+    private const val LE_AUDIO_UUID =
+        "0000184e-0000-1000-8000-00805f9b34fb"
+
+    /*
+     * Wait for BluetoothLeAudio profile proxy.
+     */
+    private const val PROFILE_PROXY_TIMEOUT_SECONDS =
         12L
+
+    /*
+     * After connect() is accepted, poll for the actual LE connection.
+     */
+    private const val CONNECTION_TIMEOUT_MS =
+        15000L
+
+    private const val CONNECTION_POLL_MS =
+        500L
 
     /*
      * ============================================================
@@ -73,17 +128,20 @@ object LeAudioShizukuBridge {
         ) {
 
             return buildResult(
-                "FAILED",
-                """
-                Android 13 or newer is required
-                for the LE Audio profile API.
-                """.trimIndent()
+                title =
+                    "FAILED",
+
+                details =
+                    """
+                    Android 13 or newer is required
+                    for Bluetooth LE Audio APIs.
+                    """.trimIndent()
             )
         }
 
         /*
          * --------------------------------------------------------
-         * BLUETOOTH PERMISSION
+         * BLUETOOTH_CONNECT PERMISSION
          * --------------------------------------------------------
          */
 
@@ -96,11 +154,14 @@ object LeAudioShizukuBridge {
         ) {
 
             return buildResult(
-                "FAILED",
-                """
-                BTMicFix does not have
-                BLUETOOTH_CONNECT permission.
-                """.trimIndent()
+                title =
+                    "FAILED",
+
+                details =
+                    """
+                    BTMicFix does not have
+                    BLUETOOTH_CONNECT permission.
+                    """.trimIndent()
             )
         }
 
@@ -115,13 +176,16 @@ object LeAudioShizukuBridge {
             if (!Shizuku.pingBinder()) {
 
                 return buildResult(
-                    "FAILED",
-                    """
-                    Shizuku is not running.
+                    title =
+                        "FAILED",
 
-                    Open Shizuku and start it,
-                    then try again.
-                    """.trimIndent()
+                    details =
+                        """
+                        Shizuku is not running.
+
+                        Open Shizuku and make sure
+                        it says Running.
+                        """.trimIndent()
                 )
             }
 
@@ -131,25 +195,31 @@ object LeAudioShizukuBridge {
             ) {
 
                 return buildResult(
-                    "FAILED",
-                    """
-                    BTMicFix does not have
-                    Shizuku permission.
-                    """.trimIndent()
+                    title =
+                        "FAILED",
+
+                    details =
+                        """
+                        BTMicFix does not have
+                        Shizuku permission.
+                        """.trimIndent()
                 )
             }
 
         } catch (e: Throwable) {
 
             return buildResult(
-                "FAILED",
-                """
-                Could not communicate with Shizuku.
+                title =
+                    "FAILED",
 
-                ${e.javaClass.name}
+                details =
+                    """
+                    Could not communicate with Shizuku.
 
-                ${e.message}
-                """.trimIndent()
+                    ${e.javaClass.name}
+
+                    ${e.message}
+                    """.trimIndent()
             )
         }
 
@@ -157,6 +227,11 @@ object LeAudioShizukuBridge {
          * --------------------------------------------------------
          * HIDDEN API ACCESS
          * --------------------------------------------------------
+         *
+         * HiddenApiBypass does NOT grant system permission.
+         *
+         * It only allows BTMicFix to access Android's hidden
+         * Bluetooth framework interfaces.
          */
 
         try {
@@ -170,16 +245,19 @@ object LeAudioShizukuBridge {
         } catch (e: Throwable) {
 
             Logger.w(
-                "Hidden API exemption error: " +
-                    "${e.javaClass.simpleName}: " +
-                    "${e.message}"
+                "Hidden API exemption setup failed: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
             )
         }
 
         /*
          * --------------------------------------------------------
-         * NORMAL BLUETOOTH ADAPTER
+         * NORMAL APP BLUETOOTH MANAGER
          * --------------------------------------------------------
+         *
+         * We intentionally do this from the normal BTMicFix process.
+         *
+         * BluetoothAdapter did NOT work from the Shizuku UserService.
          */
 
         val bluetoothManager =
@@ -197,11 +275,14 @@ object LeAudioShizukuBridge {
         if (bluetoothManager == null) {
 
             return buildResult(
-                "FAILED",
-                """
-                Normal BTMicFix process could not
-                obtain BluetoothManager.
-                """.trimIndent()
+                title =
+                    "FAILED",
+
+                details =
+                    """
+                    BluetoothManager could not be obtained
+                    from the normal BTMicFix process.
+                    """.trimIndent()
             )
         }
 
@@ -213,98 +294,97 @@ object LeAudioShizukuBridge {
             } catch (e: Throwable) {
 
                 return buildResult(
-                    "FAILED",
-                    """
-                    BluetoothManager exists,
-                    but adapter access failed.
+                    title =
+                        "FAILED",
 
-                    ${e.javaClass.name}
+                    details =
+                        """
+                        BluetoothManager exists,
+                        but BluetoothAdapter access failed.
 
-                    ${e.message}
-                    """.trimIndent()
+                        ${e.javaClass.name}
+
+                        ${e.message}
+                        """.trimIndent()
                 )
             }
 
         if (adapter == null) {
 
             return buildResult(
-                "FAILED",
-                """
-                Normal app BluetoothAdapter
-                unexpectedly returned NULL.
-                """.trimIndent()
+                title =
+                    "FAILED",
+
+                details =
+                    """
+                    BluetoothAdapter unexpectedly
+                    returned NULL.
+                    """.trimIndent()
             )
         }
 
-        if (
+        val bluetoothEnabled =
             try {
-                !adapter.isEnabled
+
+                adapter.isEnabled
+
             } catch (_: Throwable) {
-                true
+
+                false
             }
-        ) {
+
+        if (!bluetoothEnabled) {
 
             return buildResult(
-                "FAILED",
-                "Bluetooth is OFF."
+                title =
+                    "FAILED",
+
+                details =
+                    "Bluetooth is OFF."
             )
         }
 
         /*
          * ========================================================
-         * FIND THE REAL PAIRED BUDS DEVICE
+         * FIND THE REAL PAIRED BUDS
          * ========================================================
-         *
-         * AudioDeviceInfo.address on your Fold6 produced:
-         *
-         * XX:XX:XX:XX:D4:72
-         *
-         * That is not usable as a BluetoothDevice MAC.
-         *
-         * Instead, query BluetoothAdapter.bondedDevices and find
-         * Antonio's Buds4 Pro there.
          */
 
         val pairedDevices =
             try {
 
-                adapter.bondedDevices
+                adapter
+                    .bondedDevices
                     .toList()
-
-            } catch (e: SecurityException) {
-
-                return buildResult(
-                    "FAILED",
-                    """
-                    Android blocked access to paired
-                    Bluetooth devices.
-
-                    ${e.message}
-                    """.trimIndent()
-                )
 
             } catch (e: Throwable) {
 
                 return buildResult(
-                    "FAILED",
-                    """
-                    Could not read paired Bluetooth devices.
+                    title =
+                        "FAILED",
 
-                    ${e.javaClass.name}
+                    details =
+                        """
+                        Could not read paired Bluetooth devices.
 
-                    ${e.message}
-                    """.trimIndent()
+                        ${e.javaClass.name}
+
+                        ${e.message}
+                        """.trimIndent()
                 )
             }
 
         if (pairedDevices.isEmpty()) {
 
             return buildResult(
-                "FAILED",
-                """
-                Android returned zero paired
-                Bluetooth devices.
-                """.trimIndent()
+                title =
+                    "FAILED",
+
+                details =
+                    """
+                    Android returned zero paired
+                    Bluetooth devices.
+                    """.trimIndent()
             )
         }
 
@@ -320,95 +400,166 @@ object LeAudioShizukuBridge {
         if (device == null) {
 
             val pairedNames =
-                pairedDevices.joinToString(
-                    separator = "\n"
-                ) { item ->
+                pairedDevices
+                    .joinToString(
+                        separator = "\n"
+                    ) {
 
-                    safeDeviceLabel(
-                        item
-                    )
-                }
+                        safeDeviceLabel(it)
+                    }
 
             return buildResult(
-                "FAILED",
-                """
-                Could not match the selected headset
-                to a paired BluetoothDevice.
+                title =
+                    "FAILED",
 
-                Selected audio device:
-                $preferredDeviceName
+                details =
+                    """
+                    Could not identify the selected Buds.
 
-                Paired Bluetooth devices:
-                $pairedNames
-                """.trimIndent()
+                    Selected:
+                    $preferredDeviceName
+
+                    Paired devices:
+
+                    $pairedNames
+                    """.trimIndent()
             )
         }
 
+        val maskedAddress =
+            maskAddress(
+                try {
+                    device.address
+                } catch (_: Throwable) {
+                    ""
+                }
+            )
+
+        val deviceLabel =
+            safeDeviceLabel(
+                device
+            )
+
         /*
-         * This BluetoothDevice comes directly from bondedDevices,
-         * so its address is the address we want for the framework
-         * Bluetooth profile APIs.
+         * ========================================================
+         * READ REMOTE BLUETOOTH UUIDS
+         * ========================================================
+         *
+         * THIS IS IMPORTANT.
+         *
+         * Android's own LeAudioService.connect() checks whether
+         * the remote device has BluetoothUuid.LE_AUDIO.
+         *
+         * That UUID is 0x184E.
+         *
+         * If it is missing, Android will refuse the LE connection.
+         *
+         * So we test BEFORE touching the connection.
          */
 
-        val realAddress =
+        val remoteUuids =
             try {
 
-                device.address
+                device.uuids
+                    ?.map {
+                        it.uuid
+                            .toString()
+                            .lowercase()
+                    }
+                    ?: emptyList()
 
-            } catch (e: Throwable) {
+            } catch (_: Throwable) {
 
-                return buildResult(
-                    "FAILED",
-                    """
-                    Found the paired Buds,
-                    but could not read their address.
+                emptyList()
+            }
 
-                    ${e.javaClass.name}
-
-                    ${e.message}
-                    """.trimIndent()
+        val hasLeAudioUuid =
+            remoteUuids.any {
+                it.equals(
+                    LE_AUDIO_UUID,
+                    ignoreCase = true
                 )
             }
 
-        if (
-            !BluetoothAdapter
-                .checkBluetoothAddress(
-                    realAddress
-                )
-        ) {
+        val uuidDisplay =
+            if (
+                remoteUuids.isEmpty()
+            ) {
 
-            return buildResult(
-                "FAILED",
-                """
-                Paired BluetoothDevice was found,
-                but Android returned an invalid address.
+                "NONE / NOT CACHED"
 
-                Device:
-                ${safeDeviceLabel(device)}
+            } else {
 
-                Address:
-                $realAddress
-                """.trimIndent()
-            )
-        }
+                remoteUuids
+                    .joinToString(
+                        separator = "\n"
+                    )
+            }
 
         Logger.i(
-            "Matched paired BluetoothDevice: " +
-                safeDeviceLabel(device)
+            "BTMicFix paired Buds: $deviceLabel " +
+                "address=$maskedAddress " +
+                "has184E=$hasLeAudioUuid"
         )
 
         /*
-         * --------------------------------------------------------
-         * LE AUDIO PROFILE PROXY
-         * --------------------------------------------------------
+         * ========================================================
+         * SAFETY STOP
+         * ========================================================
+         *
+         * DO NOT try LE Audio if Android itself does not report
+         * the LE Audio service UUID for this paired identity.
+         *
+         * This is deliberately different from the previous build.
          */
 
-        val result =
+        if (!hasLeAudioUuid) {
+
+            return buildResult(
+                title =
+                    "STOPPED SAFELY",
+
+                details =
+                    """
+                    No Bluetooth profile changes were made.
+
+                    Device:
+                    $deviceLabel
+
+                    Address:
+                    $maskedAddress
+
+                    Android does NOT currently report
+                    the LE Audio service UUID 0x184E
+                    for this paired Buds identity.
+
+                    LE Audio UUID needed:
+                    $LE_AUDIO_UUID
+
+                    Cached Buds UUIDs:
+
+                    $uuidDisplay
+
+                    Android's LE Audio service normally
+                    refuses connect() when 0x184E is missing.
+
+                    Your HFP/A2DP connection was left alone.
+                    """.trimIndent()
+            )
+        }
+
+        /*
+         * ========================================================
+         * REQUEST BLUETOOTH LE AUDIO PROFILE PROXY
+         * ========================================================
+         */
+
+        val callbackResult =
             AtomicReference<String?>(
                 null
             )
 
-        val profileReference =
+        val proxyReference =
             AtomicReference<BluetoothProfile?>(
                 null
             )
@@ -432,19 +583,21 @@ object LeAudioShizukuBridge {
                         BluetoothProfile.LE_AUDIO
                     ) {
 
-                        result.set(
+                        callbackResult.set(
                             buildResult(
-                                "FAILED",
-                                """
-                                Android returned the wrong
-                                Bluetooth profile.
+                                title =
+                                    "FAILED",
 
-                                Expected:
-                                LE_AUDIO
+                                details =
+                                    """
+                                    Android returned the wrong profile.
 
-                                Received:
-                                $profile
-                                """.trimIndent()
+                                    Expected:
+                                    LE_AUDIO
+
+                                    Received:
+                                    $profile
+                                    """.trimIndent()
                             )
                         )
 
@@ -452,175 +605,62 @@ object LeAudioShizukuBridge {
                         return
                     }
 
-                    profileReference.set(
+                    proxyReference.set(
                         proxy
                     )
 
                     try {
 
-                        val normalStateBefore =
-                            try {
+                        callbackResult.set(
+                            connectLeAudioSafely(
+                                context =
+                                    context,
 
-                                proxy.getConnectionState(
-                                    device
-                                )
-
-                            } catch (_: Throwable) {
-
-                                -1
-                            }
-
-                        /*
-                         * =================================================
-                         * PRIVILEGED SHIZUKU CALL
-                         * =================================================
-                         */
-
-                        val privilegedResult =
-                            callSetConnectionPolicyThroughShizuku(
                                 proxy =
                                     proxy,
 
                                 device =
-                                    device
+                                    device,
+
+                                deviceLabel =
+                                    deviceLabel,
+
+                                maskedAddress =
+                                    maskedAddress,
+
+                                uuidDisplay =
+                                    uuidDisplay
                             )
+                        )
 
-                        val normalStateImmediatelyAfter =
-                            try {
-
-                                proxy.getConnectionState(
-                                    device
-                                )
-
-                            } catch (_: Throwable) {
-
-                                -1
-                            }
-
-                        if (
-                            privilegedResult.accepted
-                        ) {
-
-                            result.set(
-                                buildResult(
-                                    "ACCEPTED",
-                                    """
-                                    Android accepted the privileged
-                                    LE Audio connection-policy request.
-
-                                    Device:
-                                    ${safeDeviceLabel(device)}
-
-                                    Real paired-device address:
-                                    $realAddress
-
-                                    Binder call:
-                                    ${privilegedResult.signature}
-
-                                    Policy before:
-                                    ${privilegedResult.policyBefore}
-
-                                    Policy after:
-                                    ${privilegedResult.policyAfter}
-
-                                    LE state before:
-                                    ${connectionStateName(normalStateBefore)}
-
-                                    LE state immediately after:
-                                    ${connectionStateName(normalStateImmediatelyAfter)}
-
-                                    Wait about 5 seconds.
-
-                                    BTMicFix will retry the
-                                    BLE Headset route automatically.
-                                    """.trimIndent()
-                                )
-                            )
-
-                        } else {
-
-                            result.set(
-                                buildResult(
-                                    "REJECTED",
-                                    """
-                                    The privileged LE Audio Binder
-                                    was reached successfully.
-
-                                    Android returned FALSE.
-
-                                    Device:
-                                    ${safeDeviceLabel(device)}
-
-                                    Real paired-device address:
-                                    $realAddress
-
-                                    Binder call:
-                                    ${privilegedResult.signature}
-
-                                    Policy before:
-                                    ${privilegedResult.policyBefore}
-
-                                    Policy after:
-                                    ${privilegedResult.policyAfter}
-
-                                    LE state:
-                                    ${connectionStateName(normalStateBefore)}
-                                    """.trimIndent()
-                                )
-                            )
-                        }
-
-                    } catch (
-                        e: InvocationTargetException
-                    ) {
+                    } catch (e: Throwable) {
 
                         val actual =
-                            e.targetException
-                                ?: e
+                            if (
+                                e is InvocationTargetException
+                            ) {
 
-                        result.set(
+                                e.targetException
+                                    ?: e
+
+                            } else {
+
+                                e
+                            }
+
+                        callbackResult.set(
                             buildResult(
-                                "FAILED",
-                                """
-                                Android's LE Audio Binder threw:
+                                title =
+                                    "FAILED",
 
-                                ${actual.javaClass.name}
+                                details =
+                                    """
+                                    LE Audio connection test threw:
 
-                                ${actual.message}
-                                """.trimIndent()
-                            )
-                        )
+                                    ${actual.javaClass.name}
 
-                    } catch (
-                        e: SecurityException
-                    ) {
-
-                        result.set(
-                            buildResult(
-                                "PERMISSION DENIED",
-                                """
-                                Android rejected the privileged
-                                LE Audio Binder transaction.
-
-                                ${e.javaClass.name}
-
-                                ${e.message}
-                                """.trimIndent()
-                            )
-                        )
-
-                    } catch (
-                        e: Throwable
-                    ) {
-
-                        result.set(
-                            buildResult(
-                                "FAILED",
-                                """
-                                ${e.javaClass.name}
-
-                                ${e.message}
-                                """.trimIndent()
+                                    ${actual.message}
+                                    """.trimIndent()
                             )
                         )
 
@@ -635,19 +675,23 @@ object LeAudioShizukuBridge {
                 ) {
 
                     if (
-                        result.get() == null
+                        callbackResult.get() ==
+                        null
                     ) {
 
-                        result.set(
+                        callbackResult.set(
                             buildResult(
-                                "FAILED",
-                                """
-                                LE Audio profile service
-                                disconnected unexpectedly.
+                                title =
+                                    "FAILED",
 
-                                Profile:
-                                $profile
-                                """.trimIndent()
+                                details =
+                                    """
+                                    LE Audio profile service
+                                    disconnected unexpectedly.
+
+                                    Profile:
+                                    $profile
+                                    """.trimIndent()
                             )
                         )
                     }
@@ -658,11 +702,11 @@ object LeAudioShizukuBridge {
 
         /*
          * --------------------------------------------------------
-         * REQUEST LE AUDIO PROFILE
+         * START PROFILE PROXY REQUEST
          * --------------------------------------------------------
          */
 
-        val started =
+        val profileRequestStarted =
             try {
 
                 adapter.getProfileProxy(
@@ -671,43 +715,38 @@ object LeAudioShizukuBridge {
                     BluetoothProfile.LE_AUDIO
                 )
 
-            } catch (e: SecurityException) {
-
-                return buildResult(
-                    "PERMISSION DENIED",
-                    """
-                    Normal BTMicFix process could not
-                    request the LE Audio profile.
-
-                    ${e.message}
-                    """.trimIndent()
-                )
-
             } catch (e: Throwable) {
 
                 return buildResult(
-                    "FAILED",
-                    """
-                    LE Audio profile request failed.
+                    title =
+                        "FAILED",
 
-                    ${e.javaClass.name}
+                    details =
+                        """
+                        Could not request Android's
+                        Bluetooth LE Audio profile.
 
-                    ${e.message}
-                    """.trimIndent()
+                        ${e.javaClass.name}
+
+                        ${e.message}
+                        """.trimIndent()
                 )
             }
 
-        if (!started) {
+        if (!profileRequestStarted) {
 
             return buildResult(
-                "FAILED",
-                """
-                BluetoothAdapter.getProfileProxy(
-                    LE_AUDIO
-                )
+                title =
+                    "FAILED",
 
-                returned FALSE.
-                """.trimIndent()
+                details =
+                    """
+                    BluetoothAdapter.getProfileProxy(
+                        LE_AUDIO
+                    )
+
+                    returned FALSE.
+                    """.trimIndent()
             )
         }
 
@@ -721,7 +760,7 @@ object LeAudioShizukuBridge {
             try {
 
                 latch.await(
-                    PROFILE_WAIT_SECONDS,
+                    PROFILE_PROXY_TIMEOUT_SECONDS,
                     TimeUnit.SECONDS
                 )
 
@@ -733,32 +772,43 @@ object LeAudioShizukuBridge {
         val finalResult =
             if (callbackReceived) {
 
-                result.get()
+                callbackResult.get()
                     ?: buildResult(
-                        "FAILED",
-                        "LE Audio callback returned no result."
+                        title =
+                            "FAILED",
+
+                        details =
+                            "LE Audio callback returned no result."
                     )
 
             } else {
 
                 buildResult(
-                    "TIMEOUT",
-                    """
-                    Bluetooth works and the paired Buds
-                    were found.
+                    title =
+                        "TIMEOUT",
 
-                    Android did not deliver the
-                    LE Audio profile callback within
-                    $PROFILE_WAIT_SECONDS seconds.
-                    """.trimIndent()
+                    details =
+                        """
+                        Android did not deliver the
+                        LE Audio profile callback within
+                        $PROFILE_PROXY_TIMEOUT_SECONDS seconds.
+
+                        No connection-policy change was made.
+                        """.trimIndent()
                 )
             }
 
         /*
-         * Release local Java proxy only.
+         * --------------------------------------------------------
+         * RELEASE LOCAL PROXY
+         * --------------------------------------------------------
+         *
+         * This does NOT disconnect LE Audio.
+         *
+         * It only releases BTMicFix's Java profile proxy.
          */
 
-        profileReference
+        proxyReference
             .get()
             ?.let { profile ->
 
@@ -774,8 +824,7 @@ object LeAudioShizukuBridge {
             }
 
         Logger.i(
-            "LE Audio bridge result:\n" +
-                finalResult
+            "BTMicFix LE Audio result:\n$finalResult"
         )
 
         return finalResult
@@ -783,155 +832,452 @@ object LeAudioShizukuBridge {
 
     /*
      * ============================================================
-     * FIND MATCHING PAIRED BLUETOOTH DEVICE
+     * ACTUAL LE AUDIO CONNECTION TEST
      * ============================================================
      */
 
-    private fun findBestMatchingDevice(
-        pairedDevices: List<BluetoothDevice>,
-        preferredName: String
-    ): BluetoothDevice? {
-
-        val wanted =
-            preferredName
-                .trim()
-
-        /*
-         * #1 exact alias match
-         */
-
-        pairedDevices.firstOrNull { device ->
-
-            val alias =
-                try {
-                    device.alias
-                } catch (_: Throwable) {
-                    null
-                }
-
-            alias?.equals(
-                wanted,
-                ignoreCase = true
-            ) == true
-
-        }?.let {
-
-            return it
-        }
+    private fun connectLeAudioSafely(
+        context: Context,
+        proxy: BluetoothProfile,
+        device: BluetoothDevice,
+        deviceLabel: String,
+        maskedAddress: String,
+        uuidDisplay: String
+    ): String {
 
         /*
-         * #2 exact Bluetooth name
+         * --------------------------------------------------------
+         * CURRENT STATE
+         * --------------------------------------------------------
          */
 
-        pairedDevices.firstOrNull { device ->
+        val stateBefore =
+            try {
 
-            val name =
-                try {
-                    device.name
-                } catch (_: Throwable) {
-                    null
-                }
+                proxy.getConnectionState(
+                    device
+                )
 
-            name?.equals(
-                wanted,
-                ignoreCase = true
-            ) == true
+            } catch (_: Throwable) {
 
-        }?.let {
-
-            return it
-        }
-
-        /*
-         * #3 Buds4 Pro match.
-         *
-         * Handles aliases such as:
-         *
-         * Antonio's Buds4 Pro
-         * Galaxy Buds4 Pro
-         */
-
-        val budsMatches =
-            pairedDevices.filter { device ->
-
-                val alias =
-                    try {
-                        device.alias.orEmpty()
-                    } catch (_: Throwable) {
-                        ""
-                    }
-
-                val name =
-                    try {
-                        device.name.orEmpty()
-                    } catch (_: Throwable) {
-                        ""
-                    }
-
-                alias.contains(
-                    "Buds4 Pro",
-                    ignoreCase = true
-                ) ||
-                    name.contains(
-                        "Buds4 Pro",
-                        ignoreCase = true
-                    )
+                -1
             }
 
+        /*
+         * If Android already connected LE Audio,
+         * don't issue another connect request.
+         */
+
         if (
-            budsMatches.size == 1
+            stateBefore ==
+            BluetoothProfile.STATE_CONNECTED
         ) {
 
-            return budsMatches.first()
+            val bleRouteVisible =
+                isBleCommunicationRouteVisible(
+                    context
+                )
+
+            return buildResult(
+                title =
+                    "ACCEPTED - ALREADY CONNECTED",
+
+                details =
+                    """
+                    LE Audio is already connected.
+
+                    Device:
+                    $deviceLabel
+
+                    Address:
+                    $maskedAddress
+
+                    LE state:
+                    CONNECTED
+
+                    BLE Headset communication route:
+                    ${yesNo(bleRouteVisible)}
+
+                    BTMicFix can now attempt the
+                    BLE communication route.
+                    """.trimIndent()
+            )
         }
 
         /*
-         * #4 more forgiving:
-         * Galaxy Buds + Pro
+         * --------------------------------------------------------
+         * READ CURRENT POLICY
+         * --------------------------------------------------------
+         *
+         * Diagnostic only.
+         *
+         * WE DO NOT CHANGE IT.
          */
 
-        val looseMatches =
-            pairedDevices.filter { device ->
+        val policy =
+            readLePolicyThroughShizuku(
+                proxy =
+                    proxy,
 
-                val text =
-                    safeDeviceLabel(
+                device =
+                    device
+            )
+
+        /*
+         * --------------------------------------------------------
+         * CONNECT()
+         * --------------------------------------------------------
+         *
+         * First try Android's hidden BluetoothLeAudio.connect(device)
+         * directly from the normal BTMicFix process.
+         *
+         * AOSP defines connect() as requiring BLUETOOTH_CONNECT.
+         *
+         * If Samsung blocks that hidden framework call,
+         * we fall back to the Shizuku-wrapped LE Audio Binder.
+         */
+
+        var connectMethod =
+            "BluetoothLeAudio.connect(device)"
+
+        var connectAccepted =
+            tryNormalHiddenConnect(
+                proxy =
+                    proxy,
+
+                device =
+                    device
+            )
+
+        /*
+         * null = hidden framework invocation itself failed.
+         *
+         * In that situation, use the Shizuku Binder path.
+         */
+
+        if (
+            connectAccepted ==
+            null
+        ) {
+
+            connectMethod =
+                "Shizuku-wrapped IBluetoothLeAudio.connect()"
+
+            connectAccepted =
+                callConnectThroughShizuku(
+                    proxy =
+                        proxy,
+
+                    device =
+                        device
+                )
+        }
+
+        /*
+         * --------------------------------------------------------
+         * CONNECT IMMEDIATELY REJECTED
+         * --------------------------------------------------------
+         */
+
+        if (
+            connectAccepted !=
+            true
+        ) {
+
+            val stateAfterReject =
+                try {
+
+                    proxy.getConnectionState(
                         device
                     )
 
-                text.contains(
-                    "Buds",
-                    ignoreCase = true
-                ) &&
-                    text.contains(
-                        "Pro",
-                        ignoreCase = true
-                    )
-            }
+                } catch (_: Throwable) {
 
-        if (
-            looseMatches.size == 1
-        ) {
+                    -1
+                }
 
-            return looseMatches.first()
+            return buildResult(
+                title =
+                    "REJECTED",
+
+                details =
+                    """
+                    Android rejected the direct
+                    LE Audio connect request.
+
+                    Device:
+                    $deviceLabel
+
+                    Address:
+                    $maskedAddress
+
+                    LE UUID 0x184E:
+                    YES
+
+                    LE policy:
+                    $policy
+
+                    Connect path:
+                    $connectMethod
+
+                    LE state before:
+                    ${connectionStateName(stateBefore)}
+
+                    LE state after:
+                    ${connectionStateName(stateAfterReject)}
+
+                    No connection policy was changed.
+
+                    Cached UUIDs:
+
+                    $uuidDisplay
+                    """.trimIndent()
+            )
         }
 
-        return null
+        /*
+         * --------------------------------------------------------
+         * CONNECT REQUEST ACCEPTED
+         * --------------------------------------------------------
+         *
+         * TRUE only means Android accepted the asynchronous request.
+         *
+         * Now wait for actual STATE_CONNECTED.
+         */
+
+        val startTime =
+            System.currentTimeMillis()
+
+        var finalState =
+            stateBefore
+
+        while (
+            System.currentTimeMillis() -
+            startTime <
+            CONNECTION_TIMEOUT_MS
+        ) {
+
+            finalState =
+                try {
+
+                    proxy.getConnectionState(
+                        device
+                    )
+
+                } catch (_: Throwable) {
+
+                    -1
+                }
+
+            if (
+                finalState ==
+                BluetoothProfile.STATE_CONNECTED
+            ) {
+
+                break
+            }
+
+            try {
+
+                Thread.sleep(
+                    CONNECTION_POLL_MS
+                )
+
+            } catch (_: InterruptedException) {
+
+                break
+            }
+        }
+
+        /*
+         * --------------------------------------------------------
+         * REAL SUCCESS
+         * --------------------------------------------------------
+         */
+
+        if (
+            finalState ==
+            BluetoothProfile.STATE_CONNECTED
+        ) {
+
+            val bleRouteVisible =
+                isBleCommunicationRouteVisible(
+                    context
+                )
+
+            return buildResult(
+                title =
+                    "ACCEPTED - LE AUDIO CONNECTED",
+
+                details =
+                    """
+                    SUCCESS.
+
+                    Android actually connected
+                    the Buds through LE Audio.
+
+                    Device:
+                    $deviceLabel
+
+                    Address:
+                    $maskedAddress
+
+                    LE UUID 0x184E:
+                    YES
+
+                    LE policy:
+                    $policy
+
+                    Connect path:
+                    $connectMethod
+
+                    LE state before:
+                    ${connectionStateName(stateBefore)}
+
+                    LE state now:
+                    CONNECTED
+
+                    BLE Headset communication route:
+                    ${yesNo(bleRouteVisible)}
+
+                    BTMicFix can now try
+                    TYPE_BLE_HEADSET.
+                    """.trimIndent()
+            )
+        }
+
+        /*
+         * --------------------------------------------------------
+         * CONNECT REQUEST STARTED BUT NEVER FINISHED
+         * --------------------------------------------------------
+         *
+         * IMPORTANT:
+         *
+         * Do NOT include the word "ACCEPTED" in the title.
+         *
+         * Your HomeScreen only automatically attempts
+         * TYPE_BLE_HEADSET when the result contains ACCEPTED.
+         *
+         * We don't want it routing until LE is truly connected.
+         */
+
+        return buildResult(
+            title =
+                "LE CONNECT DID NOT COMPLETE",
+
+            details =
+                """
+                Android accepted the connect request,
+                but LE Audio did NOT reach CONNECTED
+                within ${CONNECTION_TIMEOUT_MS / 1000} seconds.
+
+                Device:
+                $deviceLabel
+
+                Address:
+                $maskedAddress
+
+                LE UUID 0x184E:
+                YES
+
+                LE policy:
+                $policy
+
+                Connect path:
+                $connectMethod
+
+                LE state before:
+                ${connectionStateName(stateBefore)}
+
+                Final LE state:
+                ${connectionStateName(finalState)}
+
+                BTMicFix did NOT change the
+                LE connection policy.
+
+                It will NOT automatically force
+                TYPE_BLE_HEADSET after this result.
+
+                If Samsung temporarily disconnected
+                the classic Buds connection during
+                the handover attempt, reconnect the
+                Buds once from Bluetooth settings.
+                """.trimIndent()
+        )
     }
 
     /*
      * ============================================================
-     * SHIZUKU BINDER WRAPPER
+     * NORMAL HIDDEN BluetoothLeAudio.connect()
+     * ============================================================
+     *
+     * Returns:
+     *
+     * true  = Android accepted request
+     * false = Android rejected request
+     * null  = hidden invocation itself unavailable/failed
+     */
+
+    private fun tryNormalHiddenConnect(
+        proxy: BluetoothProfile,
+        device: BluetoothDevice
+    ): Boolean? {
+
+        return try {
+
+            val result =
+                HiddenApiBypass.invoke(
+                    proxy.javaClass,
+                    proxy,
+                    "connect",
+                    device
+                )
+
+            val booleanResult =
+                result as? Boolean
+
+            Logger.i(
+                "Normal hidden BluetoothLeAudio.connect() = " +
+                    booleanResult
+            )
+
+            booleanResult
+
+        } catch (e: Throwable) {
+
+            val actual =
+                if (
+                    e is InvocationTargetException
+                ) {
+
+                    e.targetException
+                        ?: e
+
+                } else {
+
+                    e
+                }
+
+            Logger.w(
+                "Normal hidden connect unavailable: " +
+                    "${actual.javaClass.simpleName}: " +
+                    "${actual.message}"
+            )
+
+            null
+        }
+    }
+
+    /*
+     * ============================================================
+     * SHIZUKU-WRAPPED LE AUDIO connect()
      * ============================================================
      */
 
-    private fun callSetConnectionPolicyThroughShizuku(
+    private fun callConnectThroughShizuku(
         proxy: BluetoothProfile,
         device: BluetoothDevice
-    ): PrivilegedPolicyResult {
-
-        /*
-         * Get the hidden IBluetoothLeAudio service.
-         */
+    ): Boolean {
 
         val rawService =
             HiddenApiBypass.invoke(
@@ -961,17 +1307,13 @@ object LeAudioShizukuBridge {
         }
 
         /*
-         * Wrap Bluetooth Binder with Shizuku.
+         * The Binder transaction is forwarded through Shizuku.
          */
 
         val privilegedBinder =
             ShizukuBinderWrapper(
                 rawBinder
             )
-
-        /*
-         * Recreate hidden IBluetoothLeAudio interface.
-         */
 
         val stubClass =
             Class.forName(
@@ -989,10 +1331,6 @@ object LeAudioShizukuBridge {
                     "IBluetoothLeAudio.Stub.asInterface returned null"
                 )
 
-        /*
-         * Binder transaction is performed by shell.
-         */
-
         val shellSource =
             AttributionSource
                 .Builder(
@@ -1003,239 +1341,184 @@ object LeAudioShizukuBridge {
                 )
                 .build()
 
-        val policyBefore =
-            getPolicyIfPossible(
-                service =
-                    privilegedService,
+        /*
+         * On your current Samsung build, setConnectionPolicy()
+         * exposed the direct Binder form:
+         *
+         * setConnectionPolicy(
+         *     BluetoothDevice,
+         *     int,
+         *     AttributionSource
+         * )
+         *
+         * The matching direct LE connect form is normally:
+         *
+         * connect(
+         *     BluetoothDevice,
+         *     AttributionSource
+         * )
+         */
 
-                device =
-                    device,
-
-                source =
-                    shellSource
-            )
-
-        val setCall =
-            findSetPolicyMethod(
-                privilegedService
-            )
-
-        val accepted =
-            setCall.method.invoke(
-                privilegedService,
-                *setCall.arguments(
-                    device,
-                    shellSource
-                )
-            ) as? Boolean
-                ?: false
-
-        val policyAfter =
-            getPolicyIfPossible(
-                service =
-                    privilegedService,
-
-                device =
-                    device,
-
-                source =
-                    shellSource
-            )
-
-        return PrivilegedPolicyResult(
-            accepted =
-                accepted,
-
-            signature =
-                setCall.signature,
-
-            policyBefore =
-                policyBefore,
-
-            policyAfter =
-                policyAfter
-        )
-    }
-
-    /*
-     * ============================================================
-     * FIND setConnectionPolicy
-     * ============================================================
-     */
-
-    private fun findSetPolicyMethod(
-        service: Any
-    ): SetPolicyCall {
-
-        val methods =
-            HiddenApiBypass
-                .getDeclaredMethods(
-                    service.javaClass
-                )
-                .filterIsInstance<Method>()
+        val connectMethods =
+            privilegedService
+                .javaClass
+                .methods
                 .filter {
                     it.name ==
-                        "setConnectionPolicy"
+                        "connect"
                 }
 
+        val directMethod =
+            connectMethods
+                .firstOrNull { method ->
+
+                    val types =
+                        method.parameterTypes
+
+                    types.size == 2 &&
+
+                        types[0] ==
+                        BluetoothDevice::class.java &&
+
+                        types[1].name ==
+                        "android.content.AttributionSource"
+                }
+
+        if (
+            directMethod !=
+            null
+        ) {
+
+            directMethod.isAccessible =
+                true
+
+            val result =
+                directMethod.invoke(
+                    privilegedService,
+                    device,
+                    shellSource
+                )
+
+            return result as? Boolean
+                ?: false
+        }
+
         /*
-         * Modern Android:
+         * If Samsung changes the hidden AIDL signature,
+         * don't guess.
          *
-         * BluetoothDevice
-         * int
-         * AttributionSource
+         * Print exactly what is exposed.
          */
 
-        val modern =
-            methods.firstOrNull { method ->
-
-                val types =
-                    method.parameterTypes
-
-                types.size == 3 &&
-
-                    types[0] ==
-                    BluetoothDevice::class.java &&
-
-                    types[1] ==
-                    Int::class.javaPrimitiveType &&
-
-                    types[2].name ==
-                    "android.content.AttributionSource"
-            }
-
-        if (modern != null) {
-
-            modern.isAccessible =
-                true
-
-            return SetPolicyCall(
-                method =
-                    modern,
-
-                signature =
-                    "setConnectionPolicy(" +
-                        "BluetoothDevice, int, AttributionSource" +
-                        ")",
-
-                argumentBuilder = {
-                        device,
-                        source ->
-
-                    arrayOf(
-                        device,
-                        CONNECTION_POLICY_ALLOWED,
-                        source
-                    )
-                }
-            )
-        }
-
-        /*
-         * Older form.
-         */
-
-        val legacy =
-            methods.firstOrNull { method ->
-
-                val types =
-                    method.parameterTypes
-
-                types.size == 2 &&
-
-                    types[0] ==
-                    BluetoothDevice::class.java &&
-
-                    types[1] ==
-                    Int::class.javaPrimitiveType
-            }
-
-        if (legacy != null) {
-
-            legacy.isAccessible =
-                true
-
-            return SetPolicyCall(
-                method =
-                    legacy,
-
-                signature =
-                    "setConnectionPolicy(" +
-                        "BluetoothDevice, int" +
-                        ")",
-
-                argumentBuilder = {
-                        device,
-                        _ ->
-
-                    arrayOf(
-                        device,
-                        CONNECTION_POLICY_ALLOWED
-                    )
-                }
-            )
-        }
-
-        val found =
-            if (methods.isEmpty()) {
+        val signatures =
+            if (
+                connectMethods.isEmpty()
+            ) {
 
                 "NONE"
 
             } else {
 
-                methods.joinToString(
-                    separator = "\n"
-                ) { method ->
+                connectMethods
+                    .joinToString(
+                        separator = "\n"
+                    ) { method ->
 
-                    method.name +
-                        "(" +
-                        method.parameterTypes
-                            .joinToString(
-                                ", "
-                            ) {
-                                it.simpleName
-                            } +
-                        ") -> " +
-                        method.returnType.simpleName
-                }
+                        method.name +
+                            "(" +
+                            method.parameterTypes
+                                .joinToString(
+                                    ", "
+                                ) {
+                                    it.simpleName
+                                } +
+                            ") -> " +
+                            method.returnType.simpleName
+                    }
             }
 
         throw NoSuchMethodException(
             """
-            Could not find a supported
-            IBluetoothLeAudio.setConnectionPolicy method.
+            Supported IBluetoothLeAudio.connect()
+            signature not found.
 
-            Methods found:
+            Connect methods exposed by Samsung:
 
-            $found
+            $signatures
             """.trimIndent()
         )
     }
 
     /*
      * ============================================================
-     * READ CONNECTION POLICY
+     * READ LE AUDIO POLICY
      * ============================================================
+     *
+     * Diagnostic only.
+     *
+     * THIS FUNCTION NEVER CHANGES THE POLICY.
      */
 
-    private fun getPolicyIfPossible(
-        service: Any,
-        device: BluetoothDevice,
-        source: AttributionSource
+    private fun readLePolicyThroughShizuku(
+        proxy: BluetoothProfile,
+        device: BluetoothDevice
     ): String {
 
         return try {
 
-            val methods =
-                HiddenApiBypass
-                    .getDeclaredMethods(
-                        service.javaClass
+            val rawService =
+                HiddenApiBypass.invoke(
+                    proxy.javaClass,
+                    proxy,
+                    "getService"
+                )
+                    ?: return "UNAVAILABLE"
+
+            val rawInterface =
+                rawService as? IInterface
+                    ?: return "UNAVAILABLE"
+
+            val privilegedBinder =
+                ShizukuBinderWrapper(
+                    rawInterface.asBinder()
+                )
+
+            val stubClass =
+                Class.forName(
+                    "android.bluetooth.IBluetoothLeAudio\$Stub"
+                )
+
+            val service =
+                HiddenApiBypass.invoke(
+                    stubClass,
+                    null,
+                    "asInterface",
+                    privilegedBinder
+                )
+                    ?: return "UNAVAILABLE"
+
+            val shellSource =
+                AttributionSource
+                    .Builder(
+                        SHELL_UID
                     )
-                    .filterIsInstance<Method>()
+                    .setPackageName(
+                        SHELL_PACKAGE
+                    )
+                    .build()
+
+            val methods =
+                service
+                    .javaClass
+                    .methods
                     .filter {
                         it.name ==
                             "getConnectionPolicy"
                     }
+
+            /*
+             * Modern/direct Samsung form.
+             */
 
             val modern =
                 methods.firstOrNull { method ->
@@ -1253,7 +1536,9 @@ object LeAudioShizukuBridge {
                 }
 
             val value =
-                if (modern != null) {
+                if (
+                    modern != null
+                ) {
 
                     modern.isAccessible =
                         true
@@ -1261,7 +1546,7 @@ object LeAudioShizukuBridge {
                     modern.invoke(
                         service,
                         device,
-                        source
+                        shellSource
                     ) as? Int
 
                 } else {
@@ -1278,7 +1563,9 @@ object LeAudioShizukuBridge {
                                 BluetoothDevice::class.java
                         }
 
-                    if (legacy != null) {
+                    if (
+                        legacy != null
+                    ) {
 
                         legacy.isAccessible =
                             true
@@ -1335,7 +1622,169 @@ object LeAudioShizukuBridge {
 
     /*
      * ============================================================
-     * HELPERS
+     * CHECK WHETHER ANDROID CREATED TYPE_BLE_HEADSET
+     * ============================================================
+     */
+
+    private fun isBleCommunicationRouteVisible(
+        context: Context
+    ): Boolean {
+
+        val audioManager =
+            try {
+
+                context.getSystemService(
+                    AudioManager::class.java
+                )
+
+            } catch (_: Throwable) {
+
+                null
+            }
+                ?: return false
+
+        return try {
+
+            audioManager
+                .availableCommunicationDevices
+                .any {
+
+                    it.type ==
+                        AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+
+        } catch (_: Throwable) {
+
+            false
+        }
+    }
+
+    /*
+     * ============================================================
+     * FIND THE CORRECT PAIRED BUDS
+     * ============================================================
+     */
+
+    private fun findBestMatchingDevice(
+        pairedDevices: List<BluetoothDevice>,
+        preferredName: String
+    ): BluetoothDevice? {
+
+        val wanted =
+            preferredName.trim()
+
+        /*
+         * #1 Exact alias match.
+         */
+
+        pairedDevices
+            .firstOrNull { device ->
+
+                val alias =
+                    try {
+                        device.alias
+                    } catch (_: Throwable) {
+                        null
+                    }
+
+                alias?.equals(
+                    wanted,
+                    ignoreCase = true
+                ) == true
+            }
+            ?.let {
+
+                return it
+            }
+
+        /*
+         * #2 Exact Bluetooth device-name match.
+         */
+
+        pairedDevices
+            .firstOrNull { device ->
+
+                val name =
+                    try {
+                        device.name
+                    } catch (_: Throwable) {
+                        null
+                    }
+
+                name?.equals(
+                    wanted,
+                    ignoreCase = true
+                ) == true
+            }
+            ?.let {
+
+                return it
+            }
+
+        /*
+         * #3 Galaxy Buds4 Pro match.
+         */
+
+        val buds4Matches =
+            pairedDevices
+                .filter { device ->
+
+                    val text =
+                        safeDeviceLabel(
+                            device
+                        )
+
+                    text.contains(
+                        "Buds4 Pro",
+                        ignoreCase = true
+                    )
+                }
+
+        if (
+            buds4Matches.size ==
+            1
+        ) {
+
+            return buds4Matches.first()
+        }
+
+        /*
+         * #4 Generic Buds Pro match.
+         */
+
+        val genericMatches =
+            pairedDevices
+                .filter { device ->
+
+                    val text =
+                        safeDeviceLabel(
+                            device
+                        )
+
+                    text.contains(
+                        "Buds",
+                        ignoreCase = true
+                    ) &&
+                        text.contains(
+                            "Pro",
+                            ignoreCase = true
+                        )
+                }
+
+        if (
+            genericMatches.size ==
+            1
+        ) {
+
+            return genericMatches.first()
+        }
+
+        return null
+    }
+
+    /*
+     * ============================================================
+     * SAFE DEVICE LABEL
      * ============================================================
      */
 
@@ -1370,6 +1819,38 @@ object LeAudioShizukuBridge {
         }
     }
 
+    /*
+     * ============================================================
+     * MASK REAL BLUETOOTH ADDRESS
+     * ============================================================
+     */
+
+    private fun maskAddress(
+        address: String
+    ): String {
+
+        if (
+            address.length <
+            5
+        ) {
+
+            return "REDACTED"
+        }
+
+        val finalFive =
+            address.takeLast(
+                5
+            )
+
+        return "XX:XX:XX:XX:$finalFive"
+    }
+
+    /*
+     * ============================================================
+     * STATE NAME
+     * ============================================================
+     */
+
     private fun connectionStateName(
         state: Int
     ): String {
@@ -1393,46 +1874,40 @@ object LeAudioShizukuBridge {
         }
     }
 
+    /*
+     * ============================================================
+     * YES / NO
+     * ============================================================
+     */
+
+    private fun yesNo(
+        value: Boolean
+    ): String {
+
+        return if (value) {
+            "YES"
+        } else {
+            "NO"
+        }
+    }
+
+    /*
+     * ============================================================
+     * RESULT FORMAT
+     * ============================================================
+     */
+
     private fun buildResult(
         title: String,
         details: String
     ): String {
 
         return """
-            ===== BTMicFix LE BINDER TEST =====
+            ===== BTMicFix SAFE LE TEST =====
             $title
 
             $details
-            ===================================
+            =================================
         """.trimIndent()
-    }
-
-    private data class PrivilegedPolicyResult(
-        val accepted: Boolean,
-        val signature: String,
-        val policyBefore: String,
-        val policyAfter: String
-    )
-
-    private data class SetPolicyCall(
-        val method: Method,
-        val signature: String,
-        val argumentBuilder:
-            (
-                BluetoothDevice,
-                AttributionSource
-            ) -> Array<Any>
-    ) {
-
-        fun arguments(
-            device: BluetoothDevice,
-            source: AttributionSource
-        ): Array<Any> {
-
-            return argumentBuilder(
-                device,
-                source
-            )
-        }
     }
 }
