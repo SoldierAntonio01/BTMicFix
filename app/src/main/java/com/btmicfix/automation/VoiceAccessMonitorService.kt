@@ -1,127 +1,287 @@
 package com.btmicfix.automation
 
-import android.Manifest
 import android.app.Notification
-import android.content.pm.PackageManager
-import android.os.Handler
-import android.os.Looper
+import android.media.AudioDeviceInfo
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.telecom.TelecomManager
-import androidx.core.content.ContextCompat
 import com.btmicfix.audio.AudioRoutingManager
+import com.btmicfix.bluetooth.LeAudioCacheRefresher
+import com.btmicfix.shizuku.LeAudioShizukuBridge
 import com.btmicfix.util.Logger
-import com.btmicfix.util.Preferences
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
-class VoiceAccessMonitorService : NotificationListenerService() {
+/**
+ * Automatically controls BTMicFix from Voice Access.
+ *
+ * Voice Access LISTENING:
+ *
+ *      Buds LE Audio mic route ON
+ *
+ * Voice Access PAUSED / STOPPED:
+ *
+ *      communication route OFF
+ *      AudioManager returns to normal mode
+ *
+ * IMPORTANT:
+ *
+ * The LE Audio PROFILE itself is deliberately left connected
+ * when Voice Access pauses.
+ *
+ * That avoids doing a full HFP/A2DP <-> LE Audio profile handover
+ * every time Voice Access starts/stops, which would likely bring
+ * back the 2-3 second audio interruptions.
+ *
+ * This service is event-driven.
+ *
+ * NO repeating watchdog.
+ * NO notification polling loop.
+ */
+class VoiceAccessMonitorService :
+    NotificationListenerService() {
 
-    private lateinit var routingManager: AudioRoutingManager
+    /*
+     * ============================================================
+     * AUDIO ROUTING
+     * ============================================================
+     */
 
-    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var routingManager:
+        AudioRoutingManager
 
-    private var voiceAccessListening = false
+    /*
+     * ============================================================
+     * BACKGROUND WORK
+     * ============================================================
+     */
 
-    private val stateLoop = object : Runnable {
-        override fun run() {
-            refreshVoiceAccessState()
-            applyDesiredRouting()
-            handler.postDelayed(this, CHECK_INTERVAL_MS)
-        }
-    }
+    private val worker =
+        Executors.newSingleThreadExecutor()
+
+    private val activationRunning =
+        AtomicBoolean(
+            false
+        )
+
+    /*
+     * ============================================================
+     * VOICE ACCESS STATE
+     * ============================================================
+     */
+
+    @Volatile
+    private var voiceAccessListening =
+        false
+
+    private var lastDetectedState:
+        Boolean? =
+        null
+
+    /*
+     * ============================================================
+     * CREATE
+     * ============================================================
+     */
 
     override fun onCreate() {
+
         super.onCreate()
 
         routingManager =
-            AudioRoutingManager(applicationContext)
+            AudioRoutingManager(
+                applicationContext
+            )
 
-        // Stop old "route whenever Buds connect" behavior.
-        Preferences(applicationContext).autoRouteEnabled = false
+        routingManager
+            .startMonitoring()
+
+        Logger.i(
+            "Voice Access automation service created"
+        )
     }
+
+    /*
+     * ============================================================
+     * LISTENER CONNECTED
+     * ============================================================
+     */
 
     override fun onListenerConnected() {
+
         super.onListenerConnected()
 
-        Logger.i("Voice Access automation connected")
-
-        try {
-            routingManager.startMonitoring()
-        } catch (_: Exception) {
-        }
+        Logger.i(
+            "Notification listener connected"
+        )
 
         refreshVoiceAccessState()
-
-        handler.removeCallbacks(stateLoop)
-        handler.post(stateLoop)
     }
 
-    override fun onListenerDisconnected() {
-        handler.removeCallbacks(stateLoop)
-
-        routingManager.clearRouting()
-
-        try {
-            routingManager.stopMonitoring()
-        } catch (_: Exception) {
-        }
-
-        super.onListenerDisconnected()
-    }
+    /*
+     * ============================================================
+     * NOTIFICATION POSTED / UPDATED
+     * ============================================================
+     */
 
     override fun onNotificationPosted(
         sbn: StatusBarNotification
     ) {
-        if (sbn.packageName == VOICE_ACCESS_PACKAGE) {
+
+        if (
+            sbn.packageName ==
+            VOICE_ACCESS_PACKAGE
+        ) {
+
             refreshVoiceAccessState()
-            applyDesiredRouting()
         }
     }
+
+    /*
+     * ============================================================
+     * NOTIFICATION REMOVED
+     * ============================================================
+     */
 
     override fun onNotificationRemoved(
         sbn: StatusBarNotification
     ) {
-        if (sbn.packageName == VOICE_ACCESS_PACKAGE) {
+
+        if (
+            sbn.packageName ==
+            VOICE_ACCESS_PACKAGE
+        ) {
+
             refreshVoiceAccessState()
-            applyDesiredRouting()
         }
     }
 
+    /*
+     * ============================================================
+     * DETECT CURRENT VOICE ACCESS STATE
+     * ============================================================
+     */
+
     private fun refreshVoiceAccessState() {
 
-        val notifications =
+        val voiceNotifications =
             try {
+
                 activeNotifications
                     ?.filter {
+
                         it.packageName ==
                             VOICE_ACCESS_PACKAGE
                     }
                     ?: emptyList()
-            } catch (_: Exception) {
+
+            } catch (_: Throwable) {
+
                 emptyList()
             }
 
-        if (notifications.isEmpty()) {
-            voiceAccessListening = false
+        /*
+         * No Voice Access notification:
+         *
+         * Treat Voice Access as not listening.
+         */
+
+        if (
+            voiceNotifications.isEmpty()
+        ) {
+
+            applyVoiceAccessState(
+                false
+            )
+
             return
         }
 
-        var detectedState: Boolean? = null
+        /*
+         * Inspect each Voice Access notification.
+         */
 
-        for (sbn in notifications) {
+        var detected:
+            Boolean? =
+            null
 
-            val notification = sbn.notification
+        for (
+            sbn in voiceNotifications
+        ) {
 
-            val actionText =
-                notification.actions
+            val notification =
+                sbn.notification
+
+            val actionTexts =
+                notification
+                    .actions
                     ?.mapNotNull {
+
                         it.title
                             ?.toString()
+                            ?.trim()
                             ?.lowercase()
                     }
-                    ?.joinToString(" ")
-                    .orEmpty()
+                    ?: emptyList()
 
-            val extras = notification.extras
+            /*
+             * ----------------------------------------------------
+             * ACTION BUTTONS
+             * ----------------------------------------------------
+             *
+             * If Voice Access offers PAUSE, it is currently
+             * listening.
+             *
+             * If it offers START / RESUME, it is currently paused.
+             */
+
+            if (
+                actionTexts.any {
+
+                    it ==
+                        "start" ||
+
+                    it.contains(
+                        "start listening"
+                    ) ||
+
+                    it.contains(
+                        "resume"
+                    )
+                }
+            ) {
+
+                detected =
+                    false
+
+                break
+            }
+
+            if (
+                actionTexts.any {
+
+                    it ==
+                        "pause" ||
+
+                    it.contains(
+                        "stop listening"
+                    )
+                }
+            ) {
+
+                detected =
+                    true
+
+                break
+            }
+
+            /*
+             * ----------------------------------------------------
+             * NOTIFICATION TEXT
+             * ----------------------------------------------------
+             */
+
+            val extras =
+                notification.extras
 
             val title =
                 extras
@@ -129,7 +289,6 @@ class VoiceAccessMonitorService : NotificationListenerService() {
                         Notification.EXTRA_TITLE
                     )
                     ?.toString()
-                    ?.lowercase()
                     .orEmpty()
 
             val text =
@@ -138,7 +297,6 @@ class VoiceAccessMonitorService : NotificationListenerService() {
                         Notification.EXTRA_TEXT
                     )
                     ?.toString()
-                    ?.lowercase()
                     .orEmpty()
 
             val bigText =
@@ -147,141 +305,447 @@ class VoiceAccessMonitorService : NotificationListenerService() {
                         Notification.EXTRA_BIG_TEXT
                     )
                     ?.toString()
-                    ?.lowercase()
+                    .orEmpty()
+
+            val subText =
+                extras
+                    .getCharSequence(
+                        Notification.EXTRA_SUB_TEXT
+                    )
+                    ?.toString()
                     .orEmpty()
 
             val combined =
-                "$actionText $title $text $bigText"
+                "$title $text $bigText $subText"
+                    .lowercase()
 
-            // Voice Access notification normally says
-            // "Tap to pause" while listening.
+            /*
+             * Paused states FIRST so "not listening"
+             * cannot accidentally match "listening".
+             */
+
             if (
-                combined.contains("pause") ||
-                combined.contains("stop listening") ||
-                combined.contains("listening")
+                combined.contains(
+                    "tap to start"
+                ) ||
+
+                combined.contains(
+                    "touch to start"
+                ) ||
+
+                combined.contains(
+                    "start listening"
+                ) ||
+
+                combined.contains(
+                    "not listening"
+                ) ||
+
+                combined.contains(
+                    "paused"
+                )
             ) {
-                detectedState = true
+
+                detected =
+                    false
+
                 break
             }
 
-            // When paused it normally offers
-            // "Touch/Tap to start".
             if (
-                combined.contains("start") ||
-                combined.contains("resume") ||
-                combined.contains("paused")
+                combined.contains(
+                    "tap to pause"
+                ) ||
+
+                combined.contains(
+                    "touch to pause"
+                ) ||
+
+                combined.contains(
+                    "stop listening"
+                ) ||
+
+                combined.contains(
+                    "is listening"
+                )
             ) {
-                detectedState = false
+
+                detected =
+                    true
+
+                break
             }
         }
 
-        if (detectedState != null) {
+        /*
+         * If Samsung/Google changes the wording and we cannot
+         * confidently determine the state, preserve the current
+         * state rather than randomly switching the audio route.
+         */
 
-            if (
-                voiceAccessListening !=
-                detectedState
-            ) {
-                Logger.i(
-                    "Voice Access listening = $detectedState"
-                )
-            }
+        if (
+            detected !=
+            null
+        ) {
 
-            voiceAccessListening =
-                detectedState
+            applyVoiceAccessState(
+                detected
+            )
         }
     }
 
-    private fun applyDesiredRouting() {
+    /*
+     * ============================================================
+     * APPLY STATE
+     * ============================================================
+     */
 
-        val callActive = isPhoneCallActive()
+    private fun applyVoiceAccessState(
+        listening: Boolean
+    ) {
 
-        val shouldRoute =
-            voiceAccessListening &&
-                !callActive
+        if (
+            lastDetectedState ==
+            listening
+        ) {
 
-        if (shouldRoute) {
+            return
+        }
 
-            if (!routingManager.isBluetoothRouted()) {
+        lastDetectedState =
+            listening
 
-                val device =
-                    routingManager
-                        .findFirstBluetoothCommunicationDevice()
+        voiceAccessListening =
+            listening
 
-                if (device != null) {
+        if (listening) {
 
-                    Logger.i(
-                        "Voice Access listening → BT mic ON"
-                    )
+            Logger.i(
+                "Voice Access LISTENING -> Buds mic ON"
+            )
 
-                    routingManager
-                        .routeToBluetooth(device)
-                }
-            }
+            requestActivation()
 
         } else {
 
-            if (routingManager.isBluetoothRouted()) {
+            Logger.i(
+                "Voice Access PAUSED -> Buds mic OFF"
+            )
 
-                if (callActive) {
-                    Logger.i(
-                        "Call active → releasing BT mic routing"
-                    )
-                } else {
-                    Logger.i(
-                        "Voice Access paused → BT mic OFF"
-                    )
-                }
+            /*
+             * Release immediately.
+             *
+             * Do not wait behind Bluetooth connection work.
+             */
 
-                routingManager.clearRouting()
+            try {
+
+                routingManager
+                    .clearRouting()
+
+            } catch (e: Throwable) {
+
+                Logger.e(
+                    "Could not release Voice Access route",
+                    e
+                )
             }
         }
     }
 
-    private fun isPhoneCallActive(): Boolean {
+    /*
+     * ============================================================
+     * START BACKGROUND ACTIVATION
+     * ============================================================
+     */
+
+    private fun requestActivation() {
 
         if (
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_PHONE_STATE
-            ) != PackageManager.PERMISSION_GRANTED
+            !activationRunning
+                .compareAndSet(
+                    false,
+                    true
+                )
         ) {
-            return false
+
+            return
         }
 
-        return try {
+        worker.execute {
 
-            val telecom =
-                getSystemService(
-                    TelecomManager::class.java
+            try {
+
+                activateBudsMic()
+
+            } finally {
+
+                activationRunning.set(
+                    false
                 )
-
-            telecom?.isInCall == true
-
-        } catch (_: Exception) {
-            false
+            }
         }
     }
 
-    override fun onDestroy() {
+    /*
+     * ============================================================
+     * ACTIVATE BUDS MIC
+     * ============================================================
+     */
 
-        handler.removeCallbacks(stateLoop)
+    private fun activateBudsMic() {
 
-        routingManager.clearRouting()
+        if (!voiceAccessListening) {
+
+            return
+        }
+
+        /*
+         * ========================================================
+         * FAST PATH
+         * ========================================================
+         *
+         * If TYPE_BLE_HEADSET already exists, do not touch
+         * Shizuku, GATT, cache, or LE profile state.
+         *
+         * Just route it.
+         */
+
+        val existingBle =
+            routingManager
+                .findFirstBluetoothCommunicationDevice()
+
+        if (
+            existingBle !=
+            null
+        ) {
+
+            if (voiceAccessListening) {
+
+                routingManager
+                    .routeToBluetooth(
+                        existingBle
+                    )
+            }
+
+            return
+        }
+
+        /*
+         * ========================================================
+         * FIND BUDS NAME
+         * ========================================================
+         */
+
+        val devices =
+            routingManager
+                .availableDevices
+                .value
+
+        val buds =
+            devices
+                .firstOrNull {
+
+                    it.deviceInfo.type ==
+                        AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+                ?: devices
+                    .firstOrNull {
+
+                        it.deviceInfo.type ==
+                            AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    }
+                ?: devices
+                    .firstOrNull {
+
+                        it.name.contains(
+                            "Buds",
+                            ignoreCase =
+                                true
+                        )
+                    }
+
+        if (
+            buds ==
+            null
+        ) {
+
+            Logger.w(
+                "Voice Access automation: Buds not found"
+            )
+
+            return
+        }
+
+        val preferredName =
+            buds.name
+
+        /*
+         * ========================================================
+         * CACHE
+         * ========================================================
+         */
+
+        val refresh =
+            LeAudioCacheRefresher
+                .refresh(
+                    context =
+                        applicationContext,
+
+                    preferredDeviceName =
+                        preferredName
+                )
+
+        if (
+            !voiceAccessListening
+        ) {
+
+            return
+        }
+
+        if (
+            !refresh.cacheUpdated ||
+            !refresh.hasAscs
+        ) {
+
+            Logger.w(
+                "Voice Access automation: LE cache not ready"
+            )
+
+            return
+        }
+
+        /*
+         * ========================================================
+         * LE AUDIO PROFILE
+         * ========================================================
+         */
+
+        val connect =
+            LeAudioShizukuBridge
+                .forceLeAudio(
+                    context =
+                        applicationContext,
+
+                    preferredDeviceName =
+                        preferredName
+                )
+
+        if (
+            !voiceAccessListening
+        ) {
+
+            return
+        }
+
+        val connected =
+            connect.contains(
+                "ACCEPTED - LE AUDIO CONNECTED"
+            ) ||
+                connect.contains(
+                    "ACCEPTED - ALREADY CONNECTED"
+                )
+
+        if (!connected) {
+
+            Logger.w(
+                "Voice Access automation: LE Audio did not connect"
+            )
+
+            return
+        }
+
+        /*
+         * Small settling delay.
+         */
 
         try {
-            routingManager.stopMonitoring()
-        } catch (_: Exception) {
+
+            Thread.sleep(
+                500L
+            )
+
+        } catch (_: InterruptedException) {
         }
+
+        if (
+            !voiceAccessListening
+        ) {
+
+            return
+        }
+
+        /*
+         * ========================================================
+         * FINAL ROUTE
+         * ========================================================
+         */
+
+        routingManager
+            .routeToFirstAvailableBluetooth()
+    }
+
+    /*
+     * ============================================================
+     * DISCONNECTED
+     * ============================================================
+     */
+
+    override fun onListenerDisconnected() {
+
+        voiceAccessListening =
+            false
+
+        lastDetectedState =
+            false
+
+        try {
+
+            routingManager
+                .clearRouting()
+
+        } catch (_: Throwable) {
+        }
+
+        super.onListenerDisconnected()
+    }
+
+    /*
+     * ============================================================
+     * DESTROY
+     * ============================================================
+     */
+
+    override fun onDestroy() {
+
+        voiceAccessListening =
+            false
+
+        try {
+
+            routingManager
+                .clearRouting()
+
+        } catch (_: Throwable) {
+        }
+
+        try {
+
+            routingManager
+                .stopMonitoring()
+
+        } catch (_: Throwable) {
+        }
+
+        worker.shutdownNow()
 
         super.onDestroy()
     }
 
     companion object {
 
-        private const val VOICE_ACCESS_PACKAGE =
+        private const val
+            VOICE_ACCESS_PACKAGE =
             "com.google.android.apps.accessibility.voiceaccess"
-
-        private const val CHECK_INTERVAL_MS =
-            750L
     }
-}
+    }
