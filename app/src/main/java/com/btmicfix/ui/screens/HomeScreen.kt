@@ -33,48 +33,87 @@ import kotlinx.coroutines.withContext
 /**
  * Main BTMicFix screen.
  *
- * Experimental LE Audio version.
+ * Experimental LE Audio build.
  *
- * Normal Bluetooth APIs run from this normal Android app process.
+ * Important:
  *
- * Only the privileged LE Audio Binder transaction is routed
- * through Shizuku.
+ * We DO NOT use AudioDeviceInfo.address for the LE Audio request.
+ *
+ * Samsung masked that address as:
+ *
+ * XX:XX:XX:XX:xx:xx
+ *
+ * Instead, we pass the headset name to LeAudioShizukuBridge.
+ *
+ * LeAudioShizukuBridge then finds the real paired
+ * BluetoothDevice through BluetoothAdapter.bondedDevices.
  */
 @OptIn(
     ExperimentalMaterial3Api::class
 )
 @Composable
 fun HomeScreen(
-    audioRoutingManager:
-        AudioRoutingManager,
-    shizukuManager:
-        ShizukuManager,
-    onSetupClick:
-        () -> Unit,
-    modifier:
-        Modifier = Modifier
+    audioRoutingManager: AudioRoutingManager,
+    shizukuManager: ShizukuManager,
+    onSetupClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
+
+    /*
+     * ============================================================
+     * ROUTING STATE
+     * ============================================================
+     */
 
     val routingState by
         audioRoutingManager
             .routingState
             .collectAsState()
 
+    /*
+     * ============================================================
+     * AVAILABLE BLUETOOTH DEVICES
+     * ============================================================
+     */
+
     val availableDevices by
         audioRoutingManager
             .availableDevices
             .collectAsState()
+
+    /*
+     * ============================================================
+     * NORMAL APP CONTEXT
+     * ============================================================
+     *
+     * BluetoothManager / BluetoothAdapter work here.
+     *
+     * They did NOT work properly inside the Shizuku UserService.
+     */
 
     val context =
         LocalContext
             .current
             .applicationContext
 
+    /*
+     * ============================================================
+     * COROUTINES
+     * ============================================================
+     */
+
     val coroutineScope =
         rememberCoroutineScope()
 
+    /*
+     * ============================================================
+     * LE AUDIO TEST STATE
+     * ============================================================
+     */
+
     var leAudioResult by
         remember {
+
             mutableStateOf<String?>(
                 null
             )
@@ -82,10 +121,17 @@ fun HomeScreen(
 
     var forcingLeAudio by
         remember {
+
             mutableStateOf(
                 false
             )
         }
+
+    /*
+     * ============================================================
+     * SCREEN
+     * ============================================================
+     */
 
     Scaffold(
         modifier =
@@ -157,10 +203,9 @@ fun HomeScreen(
                     ),
 
             verticalArrangement =
-                Arrangement
-                    .spacedBy(
-                        16.dp
-                    )
+                Arrangement.spacedBy(
+                    16.dp
+                )
         ) {
 
             Spacer(
@@ -172,7 +217,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * ROUTING STATUS
+             * CURRENT ROUTING STATUS
              * ====================================================
              */
 
@@ -180,6 +225,12 @@ fun HomeScreen(
                 routingState =
                     routingState
             )
+
+            /*
+             * ====================================================
+             * NORMAL ROUTING CONTROL
+             * ====================================================
+             */
 
             RoutingControlButton(
                 routingState =
@@ -206,7 +257,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * BLUETOOTH DEVICES
+             * CONNECTED BLUETOOTH DEVICES
              * ====================================================
              */
 
@@ -237,7 +288,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * EXPERIMENTAL LE AUDIO
+             * EXPERIMENTAL LE AUDIO BUTTON
              * ====================================================
              */
 
@@ -251,7 +302,9 @@ fun HomeScreen(
                 onForceLeAudio = {
 
                     /*
-                     * Shizuku itself must already be ready.
+                     * ------------------------------------------------
+                     * SHIZUKU MUST BE READY
+                     * ------------------------------------------------
                      */
 
                     if (
@@ -271,12 +324,16 @@ fun HomeScreen(
                     }
 
                     /*
-                     * The classic HFP representation normally gives
-                     * us the physical Buds Bluetooth identity address.
+                     * ------------------------------------------------
+                     * FIND OUR CONNECTED HEADSET
+                     * ------------------------------------------------
                      *
-                     * We are NOT routing through HFP here.
+                     * Prefer the HFP/SCO endpoint because that is
+                     * currently how Samsung exposes the Buds.
                      *
-                     * We only use it to identify the paired Buds.
+                     * We only use this endpoint to get the NAME.
+                     *
+                     * We DO NOT use its masked address.
                      */
 
                     val budsDevice =
@@ -289,12 +346,19 @@ fun HomeScreen(
                             }
                             ?: availableDevices
                                 .firstOrNull {
+
                                     it.deviceInfo.type ==
                                         AudioDeviceInfo
                                             .TYPE_BLE_HEADSET
                                 }
                             ?: availableDevices
                                 .firstOrNull()
+
+                    /*
+                     * ------------------------------------------------
+                     * NO HEADSET
+                     * ------------------------------------------------
+                     */
 
                     if (
                         budsDevice ==
@@ -311,41 +375,43 @@ fun HomeScreen(
                         return@ForceLeAudioCard
                     }
 
-                    val address =
-                        budsDevice
-                            .deviceInfo
-                            .address
+                    /*
+                     * ------------------------------------------------
+                     * THIS IS THE IMPORTANT FIX
+                     * ------------------------------------------------
+                     *
+                     * OLD:
+                     *
+                     * address = address
+                     *
+                     * NEW:
+                     *
+                     * preferredDeviceName = preferredName
+                     */
 
-                    if (
-                        address.isBlank()
-                    ) {
-
-                        leAudioResult =
-                            """
-                            Android did not expose the
-                            Bluetooth identity address.
-
-                            Disconnect and reconnect
-                            the Buds, then try again.
-                            """.trimIndent()
-
-                        return@ForceLeAudioCard
-                    }
+                    val preferredName =
+                        budsDevice.name
 
                     forcingLeAudio =
                         true
 
                     leAudioResult =
                         """
-                        Starting normal-process
-                        Bluetooth + Shizuku Binder test...
+                        Finding the real paired
+                        BluetoothDevice...
 
-                        Device:
-                        ${budsDevice.name}
+                        Selected headset:
+                        $preferredName
 
-                        Address:
-                        $address
+                        AudioDeviceInfo MAC is intentionally
+                        NOT being used.
                         """.trimIndent()
+
+                    /*
+                     * ------------------------------------------------
+                     * RUN BINDER TEST
+                     * ------------------------------------------------
+                     */
 
                     coroutineScope.launch {
 
@@ -359,8 +425,8 @@ fun HomeScreen(
                                         context =
                                             context,
 
-                                        address =
-                                            address
+                                        preferredDeviceName =
+                                            preferredName
                                     )
                             }
 
@@ -368,10 +434,13 @@ fun HomeScreen(
                             result
 
                         /*
-                         * Android's LE Audio stack is asynchronous.
+                         * ------------------------------------------------
+                         * IF LE AUDIO POLICY WAS ACCEPTED
+                         * ------------------------------------------------
                          *
-                         * Once ALLOWED is accepted, give Samsung
-                         * several seconds to create TYPE_BLE_HEADSET.
+                         * Samsung's Bluetooth stack is asynchronous.
+                         *
+                         * Give it time to create TYPE_BLE_HEADSET.
                          */
 
                         if (
@@ -385,11 +454,9 @@ fun HomeScreen(
                             )
 
                             /*
-                             * Your AudioRoutingManager is the strict
-                             * BLE diagnostic build.
-                             *
-                             * It will now succeed ONLY if Samsung
-                             * actually created TYPE_BLE_HEADSET.
+                             * Your strict AudioRoutingManager will
+                             * now succeed ONLY if Android created
+                             * TYPE_BLE_HEADSET.
                              */
 
                             audioRoutingManager
@@ -404,7 +471,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * INFORMATION
+             * CURRENT EXPERIMENT INFO
              * ====================================================
              */
 
@@ -422,7 +489,7 @@ fun HomeScreen(
 
 /*
  * ================================================================
- * LE AUDIO CARD
+ * FORCE LE AUDIO CARD
  * ================================================================
  */
 
@@ -457,11 +524,16 @@ private fun ForceLeAudioCard(
                 ),
 
             verticalArrangement =
-                Arrangement
-                    .spacedBy(
-                        12.dp
-                    )
+                Arrangement.spacedBy(
+                    12.dp
+                )
         ) {
+
+            /*
+             * ----------------------------------------------------
+             * TITLE
+             * ----------------------------------------------------
+             */
 
             Row(
                 verticalAlignment =
@@ -501,11 +573,18 @@ private fun ForceLeAudioCard(
                 )
             }
 
+            /*
+             * ----------------------------------------------------
+             * DESCRIPTION
+             * ----------------------------------------------------
+             */
+
             Text(
                 text =
-                    "Normal Bluetooth runs inside BTMicFix. " +
-                        "Only the privileged LE Audio Binder call " +
-                        "is forwarded through Shizuku.",
+                    "Finds your actual paired Buds4 Pro " +
+                        "BluetoothDevice, then forwards only " +
+                        "the privileged LE Audio Binder call " +
+                        "through Shizuku.",
 
                 style =
                     MaterialTheme
@@ -517,6 +596,12 @@ private fun ForceLeAudioCard(
                         .colorScheme
                         .onSurfaceVariant
             )
+
+            /*
+             * ----------------------------------------------------
+             * FORCE LE AUDIO BUTTON
+             * ----------------------------------------------------
+             */
 
             Button(
                 onClick =
@@ -545,7 +630,9 @@ private fun ForceLeAudioCard(
                         )
             ) {
 
-                if (isWorking) {
+                if (
+                    isWorking
+                ) {
 
                     CircularProgressIndicator(
                         modifier =
@@ -577,7 +664,9 @@ private fun ForceLeAudioCard(
                 )
 
                 Text(
-                    if (isWorking) {
+                    if (
+                        isWorking
+                    ) {
 
                         "Forcing LE Audio…"
 
@@ -587,6 +676,12 @@ private fun ForceLeAudioCard(
                     }
                 )
             }
+
+            /*
+             * ----------------------------------------------------
+             * RESULT TEXT
+             * ----------------------------------------------------
+             */
 
             if (
                 result != null
@@ -616,22 +711,21 @@ private fun ForceLeAudioCard(
 
 @Composable
 private fun RoutingControlButton(
-    routingState:
-        RoutingState,
-
-    onEnableRouting:
-        () -> Unit,
-
-    onDisableRouting:
-        () -> Unit,
-
-    onRetry:
-        () -> Unit
+    routingState: RoutingState,
+    onEnableRouting: () -> Unit,
+    onDisableRouting: () -> Unit,
+    onRetry: () -> Unit
 ) {
 
     when (
         routingState
     ) {
+
+        /*
+         * --------------------------------------------------------
+         * IDLE
+         * --------------------------------------------------------
+         */
 
         is RoutingState.Idle -> {
 
@@ -681,7 +775,8 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    "Enable Routing",
+                    text =
+                        "Enable Routing",
 
                     style =
                         MaterialTheme
@@ -691,11 +786,20 @@ private fun RoutingControlButton(
             }
         }
 
+        /*
+         * --------------------------------------------------------
+         * ROUTING
+         * --------------------------------------------------------
+         */
+
         is RoutingState.Routing -> {
 
             Button(
                 onClick = {
                 },
+
+                enabled =
+                    false,
 
                 modifier =
                     Modifier
@@ -703,9 +807,6 @@ private fun RoutingControlButton(
                         .height(
                             56.dp
                         ),
-
-                enabled =
-                    false,
 
                 shape =
                     RoundedCornerShape(
@@ -731,10 +832,17 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    "Routing…"
+                    text =
+                        "Routing…"
                 )
             }
         }
+
+        /*
+         * --------------------------------------------------------
+         * ACTIVE
+         * --------------------------------------------------------
+         */
 
         is RoutingState.Active -> {
 
@@ -772,10 +880,17 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    "Disable Routing"
+                    text =
+                        "Disable Routing"
                 )
             }
         }
+
+        /*
+         * --------------------------------------------------------
+         * FAILED
+         * --------------------------------------------------------
+         */
 
         is RoutingState.Failed -> {
 
@@ -824,7 +939,8 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    "Retry"
+                    text =
+                        "Retry"
                 )
             }
         }
@@ -833,7 +949,7 @@ private fun RoutingControlButton(
 
 /*
  * ================================================================
- * INFORMATION CARD
+ * CURRENT EXPERIMENT CARD
  * ================================================================
  */
 
@@ -864,10 +980,9 @@ private fun CurrentExperimentCard() {
                 ),
 
             verticalArrangement =
-                Arrangement
-                    .spacedBy(
-                        8.dp
-                    )
+                Arrangement.spacedBy(
+                    8.dp
+                )
         ) {
 
             Text(
@@ -883,11 +998,13 @@ private fun CurrentExperimentCard() {
             Text(
                 text =
                     "Normal music stays on Samsung SSC/UHQ.\n\n" +
-                        "The button asks Android to enable the " +
-                        "Buds4 Pro LE Audio profile using a " +
-                        "Shizuku-wrapped Bluetooth Binder.\n\n" +
-                        "If Samsung creates a BLE Headset route, " +
-                        "the strict AudioRoutingManager will pick it.",
+                        "BTMicFix now identifies the real paired " +
+                        "Buds4 Pro through BluetoothAdapter rather " +
+                        "than the masked AudioDeviceInfo address.\n\n" +
+                        "Then Shizuku attempts the privileged " +
+                        "LE Audio connection-policy call.\n\n" +
+                        "If Android creates a BLE Headset endpoint, " +
+                        "the strict AudioRoutingManager will use it.",
 
                 style =
                     MaterialTheme
