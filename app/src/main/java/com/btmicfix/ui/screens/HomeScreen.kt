@@ -9,6 +9,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BluetoothAudio
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -19,34 +20,25 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.btmicfix.audio.AudioRoutingManager
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
-import com.btmicfix.shizuku.LeAudioShizukuBridge
+import com.btmicfix.bluetooth.LeGattScanner
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
 import com.btmicfix.ui.components.StatusCard
 import com.btmicfix.ui.theme.*
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Main BTMicFix screen.
+ * BTMicFix diagnostic screen.
  *
- * Experimental LE Audio build.
+ * This build focuses on SAFE live LE GATT discovery.
  *
- * Important:
+ * It does NOT use the experimental Force LE Audio Binder button.
  *
- * We DO NOT use AudioDeviceInfo.address for the LE Audio request.
- *
- * Samsung masked that address as:
- *
- * XX:XX:XX:XX:xx:xx
- *
- * Instead, we pass the headset name to LeAudioShizukuBridge.
- *
- * LeAudioShizukuBridge then finds the real paired
- * BluetoothDevice through BluetoothAdapter.bondedDevices.
+ * We first want to determine whether the Buds4 Pro actually expose
+ * the core LE Audio GATT services to this Fold6.
  */
 @OptIn(
     ExperimentalMaterial3Api::class
@@ -59,71 +51,55 @@ fun HomeScreen(
     modifier: Modifier = Modifier
 ) {
 
-    /*
-     * ============================================================
-     * ROUTING STATE
-     * ============================================================
-     */
-
     val routingState by
         audioRoutingManager
             .routingState
             .collectAsState()
-
-    /*
-     * ============================================================
-     * AVAILABLE BLUETOOTH DEVICES
-     * ============================================================
-     */
 
     val availableDevices by
         audioRoutingManager
             .availableDevices
             .collectAsState()
 
-    /*
-     * ============================================================
-     * NORMAL APP CONTEXT
-     * ============================================================
-     *
-     * BluetoothManager / BluetoothAdapter work here.
-     *
-     * They did NOT work properly inside the Shizuku UserService.
-     */
-
     val context =
         LocalContext
             .current
             .applicationContext
-
-    /*
-     * ============================================================
-     * COROUTINES
-     * ============================================================
-     */
 
     val coroutineScope =
         rememberCoroutineScope()
 
     /*
      * ============================================================
-     * LE AUDIO TEST STATE
+     * GATT SCAN STATE
      * ============================================================
      */
 
-    var leAudioResult by
+    var scanning by
         remember {
+            mutableStateOf(
+                false
+            )
+        }
 
+    var scanResult by
+        remember {
             mutableStateOf<String?>(
                 null
             )
         }
 
-    var forcingLeAudio by
+    var ascsFound by
         remember {
+            mutableStateOf<Boolean?>(
+                null
+            )
+        }
 
-            mutableStateOf(
-                false
+    var pacsFound by
+        remember {
+            mutableStateOf<Boolean?>(
+                null
             )
         }
 
@@ -217,7 +193,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * CURRENT ROUTING STATUS
+             * ROUTING DIAGNOSTIC
              * ====================================================
              */
 
@@ -225,12 +201,6 @@ fun HomeScreen(
                 routingState =
                     routingState
             )
-
-            /*
-             * ====================================================
-             * NORMAL ROUTING CONTROL
-             * ====================================================
-             */
 
             RoutingControlButton(
                 routingState =
@@ -257,7 +227,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * CONNECTED BLUETOOTH DEVICES
+             * BLUETOOTH DEVICES
              * ====================================================
              */
 
@@ -279,6 +249,12 @@ fun HomeScreen(
              * ====================================================
              * SHIZUKU STATUS
              * ====================================================
+             *
+             * We keep the status card because BTMicFix still uses
+             * Shizuku elsewhere.
+             *
+             * The LIVE GATT SCAN itself does NOT require the
+             * privileged Shizuku Binder operation.
              */
 
             ShizukuStatusCard(
@@ -288,52 +264,31 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * EXPERIMENTAL LE AUDIO BUTTON
+             * SAFE LE GATT SCAN
              * ====================================================
              */
 
-            ForceLeAudioCard(
-                isWorking =
-                    forcingLeAudio,
+            LeGattScanCard(
+                scanning =
+                    scanning,
 
                 result =
-                    leAudioResult,
+                    scanResult,
 
-                onForceLeAudio = {
+                ascsFound =
+                    ascsFound,
 
-                    /*
-                     * ------------------------------------------------
-                     * SHIZUKU MUST BE READY
-                     * ------------------------------------------------
-                     */
+                pacsFound =
+                    pacsFound,
 
-                    if (
-                        !shizukuManager
-                            .isAvailable()
-                    ) {
-
-                        leAudioResult =
-                            """
-                            Shizuku is not ready.
-
-                            Open Shizuku and make sure
-                            it says Running.
-                            """.trimIndent()
-
-                        return@ForceLeAudioCard
-                    }
+                onScan = {
 
                     /*
-                     * ------------------------------------------------
-                     * FIND OUR CONNECTED HEADSET
-                     * ------------------------------------------------
+                     * Prefer HFP representation only to identify
+                     * which headset the user currently has connected.
                      *
-                     * Prefer the HFP/SCO endpoint because that is
-                     * currently how Samsung exposes the Buds.
-                     *
-                     * We only use this endpoint to get the NAME.
-                     *
-                     * We DO NOT use its masked address.
+                     * LeGattScanner then finds the real bonded
+                     * BluetoothDevice by name.
                      */
 
                     val budsDevice =
@@ -354,64 +309,45 @@ fun HomeScreen(
                             ?: availableDevices
                                 .firstOrNull()
 
-                    /*
-                     * ------------------------------------------------
-                     * NO HEADSET
-                     * ------------------------------------------------
-                     */
-
                     if (
                         budsDevice ==
                         null
                     ) {
 
-                        leAudioResult =
+                        scanResult =
                             """
                             No Bluetooth headset found.
 
-                            Connect Antonio's Buds4 Pro first.
+                            Connect Antonio's Buds4 Pro
+                            first.
                             """.trimIndent()
 
-                        return@ForceLeAudioCard
+                        return@LeGattScanCard
                     }
-
-                    /*
-                     * ------------------------------------------------
-                     * THIS IS THE IMPORTANT FIX
-                     * ------------------------------------------------
-                     *
-                     * OLD:
-                     *
-                     * address = address
-                     *
-                     * NEW:
-                     *
-                     * preferredDeviceName = preferredName
-                     */
 
                     val preferredName =
                         budsDevice.name
 
-                    forcingLeAudio =
+                    scanning =
                         true
 
-                    leAudioResult =
-                        """
-                        Finding the real paired
-                        BluetoothDevice...
+                    ascsFound =
+                        null
 
-                        Selected headset:
+                    pacsFound =
+                        null
+
+                    scanResult =
+                        """
+                        Connecting temporarily to the
+                        Buds over Bluetooth LE GATT...
+
+                        Device:
                         $preferredName
 
-                        AudioDeviceInfo MAC is intentionally
-                        NOT being used.
+                        No HFP/A2DP profile changes
+                        are being requested.
                         """.trimIndent()
-
-                    /*
-                     * ------------------------------------------------
-                     * RUN BINDER TEST
-                     * ------------------------------------------------
-                     */
 
                     coroutineScope.launch {
 
@@ -420,50 +356,25 @@ fun HomeScreen(
                                 Dispatchers.IO
                             ) {
 
-                                LeAudioShizukuBridge
-                                    .forceLeAudio(
-                                        context =
-                                            context,
+                                LeGattScanner.scan(
+                                    context =
+                                        context,
 
-                                        preferredDeviceName =
-                                            preferredName
-                                    )
+                                    preferredDeviceName =
+                                        preferredName
+                                )
                             }
 
-                        leAudioResult =
-                            result
+                        scanResult =
+                            result.text
 
-                        /*
-                         * ------------------------------------------------
-                         * IF LE AUDIO POLICY WAS ACCEPTED
-                         * ------------------------------------------------
-                         *
-                         * Samsung's Bluetooth stack is asynchronous.
-                         *
-                         * Give it time to create TYPE_BLE_HEADSET.
-                         */
+                        ascsFound =
+                            result.hasAscs
 
-                        if (
-                            result.contains(
-                                "ACCEPTED"
-                            )
-                        ) {
+                        pacsFound =
+                            result.hasPacs
 
-                            delay(
-                                5000
-                            )
-
-                            /*
-                             * Your strict AudioRoutingManager will
-                             * now succeed ONLY if Android created
-                             * TYPE_BLE_HEADSET.
-                             */
-
-                            audioRoutingManager
-                                .routeToFirstAvailableBluetooth()
-                        }
-
-                        forcingLeAudio =
+                        scanning =
                             false
                     }
                 }
@@ -471,7 +382,7 @@ fun HomeScreen(
 
             /*
              * ====================================================
-             * CURRENT EXPERIMENT INFO
+             * CURRENT EXPERIMENT
              * ====================================================
              */
 
@@ -489,15 +400,17 @@ fun HomeScreen(
 
 /*
  * ================================================================
- * FORCE LE AUDIO CARD
+ * LIVE LE GATT SCAN CARD
  * ================================================================
  */
 
 @Composable
-private fun ForceLeAudioCard(
-    isWorking: Boolean,
+private fun LeGattScanCard(
+    scanning: Boolean,
     result: String?,
-    onForceLeAudio: () -> Unit
+    ascsFound: Boolean?,
+    pacsFound: Boolean?,
+    onScan: () -> Unit
 ) {
 
     Card(
@@ -529,12 +442,6 @@ private fun ForceLeAudioCard(
                 )
         ) {
 
-            /*
-             * ----------------------------------------------------
-             * TITLE
-             * ----------------------------------------------------
-             */
-
             Row(
                 verticalAlignment =
                     Alignment.CenterVertically
@@ -542,8 +449,7 @@ private fun ForceLeAudioCard(
 
                 Icon(
                     imageVector =
-                        Icons.Default
-                            .BluetoothAudio,
+                        Icons.Default.Search,
 
                     contentDescription =
                         null,
@@ -561,7 +467,7 @@ private fun ForceLeAudioCard(
 
                 Text(
                     text =
-                        "Experimental LE Audio",
+                        "Live Buds LE Service Scan",
 
                     style =
                         MaterialTheme
@@ -573,18 +479,11 @@ private fun ForceLeAudioCard(
                 )
             }
 
-            /*
-             * ----------------------------------------------------
-             * DESCRIPTION
-             * ----------------------------------------------------
-             */
-
             Text(
                 text =
-                    "Finds your actual paired Buds4 Pro " +
-                        "BluetoothDevice, then forwards only " +
-                        "the privileged LE Audio Binder call " +
-                        "through Shizuku.",
+                    "Safely connects to the Buds' GATT server " +
+                        "over Bluetooth LE and checks the actual " +
+                        "services being exposed right now.",
 
                 style =
                     MaterialTheme
@@ -599,16 +498,66 @@ private fun ForceLeAudioCard(
 
             /*
              * ----------------------------------------------------
-             * FORCE LE AUDIO BUTTON
+             * QUICK RESULT BOX
+             * ----------------------------------------------------
+             */
+
+            if (
+                ascsFound != null ||
+                pacsFound != null
+            ) {
+
+                HorizontalDivider()
+
+                Text(
+                    text =
+                        "ASCS 0x184E: " +
+                            when (ascsFound) {
+                                true -> "YES"
+                                false -> "NO"
+                                null -> "UNKNOWN"
+                            },
+
+                    style =
+                        MaterialTheme
+                            .typography
+                            .bodyMedium,
+
+                    fontWeight =
+                        FontWeight.Bold
+                )
+
+                Text(
+                    text =
+                        "PACS 0x1850: " +
+                            when (pacsFound) {
+                                true -> "YES"
+                                false -> "NO"
+                                null -> "UNKNOWN"
+                            },
+
+                    style =
+                        MaterialTheme
+                            .typography
+                            .bodyMedium,
+
+                    fontWeight =
+                        FontWeight.Bold
+                )
+            }
+
+            /*
+             * ----------------------------------------------------
+             * SCAN BUTTON
              * ----------------------------------------------------
              */
 
             Button(
                 onClick =
-                    onForceLeAudio,
+                    onScan,
 
                 enabled =
-                    !isWorking,
+                    !scanning,
 
                 modifier =
                     Modifier
@@ -630,9 +579,7 @@ private fun ForceLeAudioCard(
                         )
             ) {
 
-                if (
-                    isWorking
-                ) {
+                if (scanning) {
 
                     CircularProgressIndicator(
                         modifier =
@@ -664,22 +611,20 @@ private fun ForceLeAudioCard(
                 )
 
                 Text(
-                    if (
-                        isWorking
-                    ) {
+                    if (scanning) {
 
-                        "Forcing LE Audio…"
+                        "Scanning LE Services…"
 
                     } else {
 
-                        "Force LE Audio (Binder)"
+                        "Scan Buds LE Services"
                     }
                 )
             }
 
             /*
              * ----------------------------------------------------
-             * RESULT TEXT
+             * FULL RESULT
              * ----------------------------------------------------
              */
 
@@ -705,7 +650,7 @@ private fun ForceLeAudioCard(
 
 /*
  * ================================================================
- * NORMAL ROUTING BUTTON
+ * NORMAL ROUTING CONTROL
  * ================================================================
  */
 
@@ -720,12 +665,6 @@ private fun RoutingControlButton(
     when (
         routingState
     ) {
-
-        /*
-         * --------------------------------------------------------
-         * IDLE
-         * --------------------------------------------------------
-         */
 
         is RoutingState.Idle -> {
 
@@ -759,12 +698,7 @@ private fun RoutingControlButton(
                             .PowerSettingsNew,
 
                     contentDescription =
-                        null,
-
-                    modifier =
-                        Modifier.size(
-                            20.dp
-                        )
+                        null
                 )
 
                 Spacer(
@@ -775,22 +709,10 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    text =
-                        "Enable Routing",
-
-                    style =
-                        MaterialTheme
-                            .typography
-                            .labelLarge
+                    "Enable Routing"
                 )
             }
         }
-
-        /*
-         * --------------------------------------------------------
-         * ROUTING
-         * --------------------------------------------------------
-         */
 
         is RoutingState.Routing -> {
 
@@ -806,12 +728,7 @@ private fun RoutingControlButton(
                         .fillMaxWidth()
                         .height(
                             56.dp
-                        ),
-
-                shape =
-                    RoundedCornerShape(
-                        16.dp
-                    )
+                        )
             ) {
 
                 CircularProgressIndicator(
@@ -832,17 +749,10 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    text =
-                        "Routing…"
+                    "Routing…"
                 )
             }
         }
-
-        /*
-         * --------------------------------------------------------
-         * ACTIVE
-         * --------------------------------------------------------
-         */
 
         is RoutingState.Active -> {
 
@@ -855,12 +765,7 @@ private fun RoutingControlButton(
                         .fillMaxWidth()
                         .height(
                             56.dp
-                        ),
-
-                shape =
-                    RoundedCornerShape(
-                        16.dp
-                    )
+                        )
             ) {
 
                 Icon(
@@ -880,17 +785,10 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    text =
-                        "Disable Routing"
+                    "Disable Routing"
                 )
             }
         }
-
-        /*
-         * --------------------------------------------------------
-         * FAILED
-         * --------------------------------------------------------
-         */
 
         is RoutingState.Failed -> {
 
@@ -904,11 +802,6 @@ private fun RoutingControlButton(
                         .height(
                             56.dp
                         ),
-
-                shape =
-                    RoundedCornerShape(
-                        16.dp
-                    ),
 
                 colors =
                     ButtonDefaults
@@ -924,8 +817,7 @@ private fun RoutingControlButton(
 
                 Icon(
                     imageVector =
-                        Icons.Default
-                            .Refresh,
+                        Icons.Default.Refresh,
 
                     contentDescription =
                         null
@@ -939,8 +831,7 @@ private fun RoutingControlButton(
                 )
 
                 Text(
-                    text =
-                        "Retry"
+                    "Retry"
                 )
             }
         }
@@ -949,7 +840,7 @@ private fun RoutingControlButton(
 
 /*
  * ================================================================
- * CURRENT EXPERIMENT CARD
+ * CURRENT EXPERIMENT
  * ================================================================
  */
 
@@ -997,14 +888,14 @@ private fun CurrentExperimentCard() {
 
             Text(
                 text =
-                    "Normal music stays on Samsung SSC/UHQ.\n\n" +
-                        "BTMicFix now identifies the real paired " +
-                        "Buds4 Pro through BluetoothAdapter rather " +
-                        "than the masked AudioDeviceInfo address.\n\n" +
-                        "Then Shizuku attempts the privileged " +
-                        "LE Audio connection-policy call.\n\n" +
-                        "If Android creates a BLE Headset endpoint, " +
-                        "the strict AudioRoutingManager will use it.",
+                    "We are not forcing LE Audio yet.\n\n" +
+                        "The previous Android cached UUID list " +
+                        "did not contain ASCS 0x184E.\n\n" +
+                        "This test asks the Buds' live LE GATT " +
+                        "server directly which services it exposes.\n\n" +
+                        "The two results we care about are:\n\n" +
+                        "ASCS 0x184E\n" +
+                        "PACS 0x1850",
 
                 style =
                     MaterialTheme
