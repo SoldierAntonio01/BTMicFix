@@ -14,6 +14,9 @@ import rikka.shizuku.Shizuku
 
 /**
  * Manages Shizuku availability, permission, and UserService lifecycle.
+ *
+ * This version includes support for the experimental
+ * Force LE Audio privileged Shizuku service.
  */
 class ShizukuManager {
 
@@ -33,21 +36,16 @@ class ShizukuManager {
         IPrivilegedService? = null
 
     enum class ShizukuStatus {
-
         UNKNOWN,
-
         NOT_INSTALLED,
-
         NOT_RUNNING,
-
         PERMISSION_NEEDED,
-
         READY
     }
 
     /*
      * ============================================================
-     * SHIZUKU BINDER LIFECYCLE
+     * SHIZUKU BINDER RECEIVED
      * ============================================================
      */
 
@@ -60,10 +58,6 @@ class ShizukuManager {
 
             refreshStatus()
 
-            /*
-             * Automatically bind the privileged service when
-             * Shizuku becomes ready.
-             */
             if (
                 _status.value ==
                 ShizukuStatus.READY
@@ -72,6 +66,12 @@ class ShizukuManager {
                 bindPrivilegedService()
             }
         }
+
+    /*
+     * ============================================================
+     * SHIZUKU BINDER DEAD
+     * ============================================================
+     */
 
     private val binderDeadListener =
         Shizuku.OnBinderDeadListener {
@@ -87,6 +87,12 @@ class ShizukuManager {
                 ShizukuStatus.NOT_RUNNING
         }
 
+    /*
+     * ============================================================
+     * SHIZUKU PERMISSION RESULT
+     * ============================================================
+     */
+
     private val permissionResultListener =
         Shizuku.OnRequestPermissionResultListener {
                 _,
@@ -94,8 +100,7 @@ class ShizukuManager {
 
             permissionGranted =
                 grantResult ==
-                    PackageManager
-                        .PERMISSION_GRANTED
+                    PackageManager.PERMISSION_GRANTED
 
             if (permissionGranted) {
 
@@ -115,8 +120,7 @@ class ShizukuManager {
                 )
 
                 _status.value =
-                    ShizukuStatus
-                        .PERMISSION_NEEDED
+                    ShizukuStatus.PERMISSION_NEEDED
             }
         }
 
@@ -142,10 +146,9 @@ class ShizukuManager {
                 binderDeadListener
             )
 
-            Shizuku
-                .addRequestPermissionResultListener(
-                    permissionResultListener
-                )
+            Shizuku.addRequestPermissionResultListener(
+                permissionResultListener
+            )
 
             refreshStatus()
 
@@ -187,10 +190,9 @@ class ShizukuManager {
                 binderDeadListener
             )
 
-            Shizuku
-                .removeRequestPermissionResultListener(
-                    permissionResultListener
-                )
+            Shizuku.removeRequestPermissionResultListener(
+                permissionResultListener
+            )
 
         } catch (e: Exception) {
 
@@ -203,7 +205,7 @@ class ShizukuManager {
 
     /*
      * ============================================================
-     * STATUS
+     * REFRESH STATUS
      * ============================================================
      */
 
@@ -216,14 +218,11 @@ class ShizukuManager {
                     !Shizuku.pingBinder()
                 ) {
 
-                    ShizukuStatus
-                        .NOT_RUNNING
+                    ShizukuStatus.NOT_RUNNING
 
                 } else if (
-                    Shizuku
-                        .checkSelfPermission() ==
-                    PackageManager
-                        .PERMISSION_GRANTED
+                    Shizuku.checkSelfPermission() ==
+                    PackageManager.PERMISSION_GRANTED
                 ) {
 
                     permissionGranted =
@@ -233,8 +232,7 @@ class ShizukuManager {
 
                 } else {
 
-                    ShizukuStatus
-                        .PERMISSION_NEEDED
+                    ShizukuStatus.PERMISSION_NEEDED
                 }
 
             } catch (
@@ -246,14 +244,13 @@ class ShizukuManager {
                     e
                 )
 
-                ShizukuStatus
-                    .NOT_INSTALLED
+                ShizukuStatus.NOT_INSTALLED
             }
     }
 
     /*
      * ============================================================
-     * REQUEST PERMISSION
+     * REQUEST SHIZUKU PERMISSION
      * ============================================================
      */
 
@@ -289,6 +286,12 @@ class ShizukuManager {
         }
     }
 
+    /*
+     * ============================================================
+     * AVAILABILITY
+     * ============================================================
+     */
+
     fun isAvailable():
         Boolean {
 
@@ -297,6 +300,12 @@ class ShizukuManager {
                 ShizukuStatus.READY
             )
     }
+
+    /*
+     * ============================================================
+     * PRIVILEGED SERVICE STATUS
+     * ============================================================
+     */
 
     fun isPrivilegedServiceConnected():
         Boolean {
@@ -334,7 +343,9 @@ class ShizukuManager {
                 FAILED
 
                 Shizuku is not ready.
-                Open Shizuku and make sure it is running.
+
+                Open Shizuku and make sure
+                it says Running.
                 ===================================
             """.trimIndent()
         }
@@ -356,7 +367,7 @@ class ShizukuManager {
 
                 The privileged service is starting.
 
-                Wait one second and press
+                Wait about one second and press
                 Force LE Audio again.
                 ===================================
             """.trimIndent()
@@ -395,7 +406,7 @@ class ShizukuManager {
 
     /*
      * ============================================================
-     * ORIGINAL SHELL COMMAND SUPPORT
+     * EXECUTE PRIVILEGED SHELL COMMAND
      * ============================================================
      */
 
@@ -439,6 +450,12 @@ class ShizukuManager {
         }
     }
 
+    /*
+     * ============================================================
+     * GET AUDIO DIAGNOSTICS
+     * ============================================================
+     */
+
     fun getAudioDiagnostics():
         String? {
 
@@ -463,7 +480,7 @@ class ShizukuManager {
 
     /*
      * ============================================================
-     * BIND USER SERVICE
+     * BIND PRIVILEGED USER SERVICE
      * ============================================================
      */
 
@@ -479,11 +496,15 @@ class ShizukuManager {
         }
 
         /*
-         * Avoid needless duplicate binds.
+         * Avoid duplicate service bindings.
          */
         if (
             isPrivilegedServiceConnected()
         ) {
+
+            Logger.d(
+                "PrivilegedService already connected"
+            )
 
             return
         }
@@ -516,7 +537,7 @@ class ShizukuManager {
 
     /*
      * ============================================================
-     * UNBIND
+     * UNBIND PRIVILEGED USER SERVICE
      * ============================================================
      */
 
@@ -534,7 +555,14 @@ class ShizukuManager {
                 true
             )
 
-        } catch (_: Exception) {
+        } catch (
+            e: Exception
+        ) {
+
+            Logger.e(
+                "Could not unbind PrivilegedService",
+                e
+            )
         }
 
         privilegedService =
@@ -543,7 +571,7 @@ class ShizukuManager {
 
     /*
      * ============================================================
-     * USER SERVICE ARGS
+     * BUILD SHIZUKU USER SERVICE ARGUMENTS
      * ============================================================
      */
 
@@ -558,7 +586,9 @@ class ShizukuManager {
                     PrivilegedServiceImpl::class.java.name
                 )
             )
-                .daemon(false)
+                .daemon(
+                    false
+                )
                 .processNameSuffix(
                     "privileged"
                 )
@@ -566,11 +596,10 @@ class ShizukuManager {
                     BuildConfig.DEBUG
                 )
                 /*
-                 * IMPORTANT:
+                 * IMPORTANT
                  *
-                 * Increment this independently from VERSION_CODE.
-                 * This forces Shizuku to restart the UserService
-                 * when this new implementation is installed.
+                 * Version 3 forces Shizuku to kill the previous
+                 * UserService and load our new Bluetooth adapter fix.
                  */
                 .version(
                     PRIVILEGED_SERVICE_VERSION
@@ -591,12 +620,13 @@ class ShizukuManager {
 
     /*
      * ============================================================
-     * SERVICE CONNECTION
+     * SHIZUKU USER SERVICE CONNECTION
      * ============================================================
      */
 
     private val userServiceConnection =
-        object : ServiceConnection {
+        object :
+            ServiceConnection {
 
             override fun onServiceConnected(
                 name: ComponentName?,
@@ -616,7 +646,16 @@ class ShizukuManager {
                             )
 
                     Logger.i(
-                        "PrivilegedService connected"
+                        "PrivilegedService connected successfully"
+                    )
+
+                } else {
+
+                    privilegedService =
+                        null
+
+                    Logger.e(
+                        "PrivilegedService returned invalid binder"
                     )
                 }
             }
@@ -632,7 +671,37 @@ class ShizukuManager {
                     "PrivilegedService disconnected"
                 )
             }
+
+            override fun onBindingDied(
+                name: ComponentName?
+            ) {
+
+                privilegedService =
+                    null
+
+                Logger.w(
+                    "PrivilegedService binding died"
+                )
+            }
+
+            override fun onNullBinding(
+                name: ComponentName?
+            ) {
+
+                privilegedService =
+                    null
+
+                Logger.e(
+                    "PrivilegedService returned null binding"
+                )
+            }
         }
+
+    /*
+     * ============================================================
+     * CONSTANTS
+     * ============================================================
+     */
 
     companion object {
 
@@ -641,10 +710,18 @@ class ShizukuManager {
             1337
 
         /*
-         * Change this if we change the UserService implementation.
+         * IMPORTANT:
+         *
+         * This MUST now be 3.
+         *
+         * Previous version = 2.
+         *
+         * Increasing it forces Shizuku to restart
+         * the UserService with the updated
+         * PrivilegedServiceImpl Bluetooth fix.
          */
         private const val
             PRIVILEGED_SERVICE_VERSION =
-            2
+            3
     }
 }
