@@ -14,10 +14,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.btmicfix.audio.AudioRoutingManager
 import com.btmicfix.audio.AudioRoutingManager.RoutingState
+import com.btmicfix.shizuku.LeAudioShizukuBridge
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
@@ -31,8 +33,12 @@ import kotlinx.coroutines.withContext
 /**
  * Main BTMicFix screen.
  *
- * Adds an experimental Shizuku button that attempts to enable
- * the Buds' hidden LE Audio profile.
+ * Experimental LE Audio version.
+ *
+ * Normal Bluetooth APIs run from this normal Android app process.
+ *
+ * Only the privileged LE Audio Binder transaction is routed
+ * through Shizuku.
  */
 @OptIn(
     ExperimentalMaterial3Api::class
@@ -59,6 +65,11 @@ fun HomeScreen(
             .availableDevices
             .collectAsState()
 
+    val context =
+        LocalContext
+            .current
+            .applicationContext
+
     val coroutineScope =
         rememberCoroutineScope()
 
@@ -79,6 +90,7 @@ fun HomeScreen(
     Scaffold(
         modifier =
             modifier,
+
         topBar = {
 
             TopAppBar(
@@ -87,18 +99,22 @@ fun HomeScreen(
                     Text(
                         text =
                             "BTMicFix",
+
                         fontWeight =
                             FontWeight.Bold
                     )
                 },
+
                 colors =
                     TopAppBarDefaults
                         .topAppBarColors(
                             containerColor =
                                 SurfaceDark,
+
                             titleContentColor =
                                 Purple80
                         ),
+
                 actions = {
 
                     IconButton(
@@ -109,8 +125,10 @@ fun HomeScreen(
                         Icon(
                             imageVector =
                                 Icons.Default.Settings,
+
                             contentDescription =
                                 "Setup",
+
                             tint =
                                 Purple80
                         )
@@ -118,6 +136,7 @@ fun HomeScreen(
                 }
             )
         },
+
         containerColor =
             SurfaceDark
     ) { innerPadding ->
@@ -136,6 +155,7 @@ fun HomeScreen(
                     .verticalScroll(
                         rememberScrollState()
                     ),
+
             verticalArrangement =
                 Arrangement
                     .spacedBy(
@@ -151,8 +171,11 @@ fun HomeScreen(
             )
 
             /*
-             * Normal routing status.
+             * ====================================================
+             * ROUTING STATUS
+             * ====================================================
              */
+
             StatusCard(
                 routingState =
                     routingState
@@ -182,8 +205,11 @@ fun HomeScreen(
             )
 
             /*
-             * Available BT devices.
+             * ====================================================
+             * BLUETOOTH DEVICES
+             * ====================================================
              */
+
             DeviceSelector(
                 devices =
                     availableDevices,
@@ -199,17 +225,22 @@ fun HomeScreen(
             )
 
             /*
-             * Existing Shizuku card.
+             * ====================================================
+             * SHIZUKU STATUS
+             * ====================================================
              */
+
             ShizukuStatusCard(
                 shizukuManager =
                     shizukuManager
             )
 
             /*
-             * NEW:
-             * Force LE Audio button.
+             * ====================================================
+             * EXPERIMENTAL LE AUDIO
+             * ====================================================
              */
+
             ForceLeAudioCard(
                 isWorking =
                     forcingLeAudio,
@@ -220,10 +251,34 @@ fun HomeScreen(
                 onForceLeAudio = {
 
                     /*
-                     * Prefer the HFP/SCO representation of the Buds
-                     * because it normally exposes their Bluetooth
-                     * identity address.
+                     * Shizuku itself must already be ready.
                      */
+
+                    if (
+                        !shizukuManager
+                            .isAvailable()
+                    ) {
+
+                        leAudioResult =
+                            """
+                            Shizuku is not ready.
+
+                            Open Shizuku and make sure
+                            it says Running.
+                            """.trimIndent()
+
+                        return@ForceLeAudioCard
+                    }
+
+                    /*
+                     * The classic HFP representation normally gives
+                     * us the physical Buds Bluetooth identity address.
+                     *
+                     * We are NOT routing through HFP here.
+                     *
+                     * We only use it to identify the paired Buds.
+                     */
+
                     val budsDevice =
                         availableDevices
                             .firstOrNull {
@@ -232,6 +287,12 @@ fun HomeScreen(
                                     AudioDeviceInfo
                                         .TYPE_BLUETOOTH_SCO
                             }
+                            ?: availableDevices
+                                .firstOrNull {
+                                    it.deviceInfo.type ==
+                                        AudioDeviceInfo
+                                            .TYPE_BLE_HEADSET
+                                }
                             ?: availableDevices
                                 .firstOrNull()
 
@@ -242,7 +303,7 @@ fun HomeScreen(
 
                         leAudioResult =
                             """
-                            No Bluetooth headset was found.
+                            No Bluetooth headset found.
 
                             Connect Antonio's Buds4 Pro first.
                             """.trimIndent()
@@ -261,11 +322,11 @@ fun HomeScreen(
 
                         leAudioResult =
                             """
-                            Android did not expose a Bluetooth
-                            address for this headset.
+                            Android did not expose the
+                            Bluetooth identity address.
 
-                            Disconnect and reconnect the Buds,
-                            then try again.
+                            Disconnect and reconnect
+                            the Buds, then try again.
                             """.trimIndent()
 
                         return@ForceLeAudioCard
@@ -276,7 +337,8 @@ fun HomeScreen(
 
                     leAudioResult =
                         """
-                        Starting Shizuku LE Audio request...
+                        Starting normal-process
+                        Bluetooth + Shizuku Binder test...
 
                         Device:
                         ${budsDevice.name}
@@ -287,27 +349,18 @@ fun HomeScreen(
 
                     coroutineScope.launch {
 
-                        /*
-                         * Ensure the Shizuku UserService is alive.
-                         */
-                        shizukuManager
-                            .bindPrivilegedService()
-
-                        /*
-                         * Give Binder time to connect.
-                         */
-                        delay(
-                            1000
-                        )
-
                         val result =
                             withContext(
                                 Dispatchers.IO
                             ) {
 
-                                shizukuManager
+                                LeAudioShizukuBridge
                                     .forceLeAudio(
-                                        address
+                                        context =
+                                            context,
+
+                                        address =
+                                            address
                                     )
                             }
 
@@ -315,22 +368,29 @@ fun HomeScreen(
                             result
 
                         /*
-                         * If Android accepted the LE Audio request,
-                         * wait a little longer and have our strict
-                         * AudioRoutingManager check again.
+                         * Android's LE Audio stack is asynchronous.
+                         *
+                         * Once ALLOWED is accepted, give Samsung
+                         * several seconds to create TYPE_BLE_HEADSET.
                          */
+
                         if (
-                            result.contains(
-                                "SUCCESS"
-                            ) ||
                             result.contains(
                                 "ACCEPTED"
                             )
                         ) {
 
                             delay(
-                                2500
+                                5000
                             )
+
+                            /*
+                             * Your AudioRoutingManager is the strict
+                             * BLE diagnostic build.
+                             *
+                             * It will now succeed ONLY if Samsung
+                             * actually created TYPE_BLE_HEADSET.
+                             */
 
                             audioRoutingManager
                                 .routeToFirstAvailableBluetooth()
@@ -342,7 +402,13 @@ fun HomeScreen(
                 }
             )
 
-            HowItWorksCard()
+            /*
+             * ====================================================
+             * INFORMATION
+             * ====================================================
+             */
+
+            CurrentExperimentCard()
 
             Spacer(
                 modifier =
@@ -356,7 +422,7 @@ fun HomeScreen(
 
 /*
  * ================================================================
- * FORCE LE AUDIO CARD
+ * LE AUDIO CARD
  * ================================================================
  */
 
@@ -370,10 +436,12 @@ private fun ForceLeAudioCard(
     Card(
         modifier =
             Modifier.fillMaxWidth(),
+
         shape =
             RoundedCornerShape(
                 16.dp
             ),
+
         colors =
             CardDefaults
                 .cardColors(
@@ -387,6 +455,7 @@ private fun ForceLeAudioCard(
                 Modifier.padding(
                     16.dp
                 ),
+
             verticalArrangement =
                 Arrangement
                     .spacedBy(
@@ -396,16 +465,17 @@ private fun ForceLeAudioCard(
 
             Row(
                 verticalAlignment =
-                    Alignment
-                        .CenterVertically
+                    Alignment.CenterVertically
             ) {
 
                 Icon(
                     imageVector =
                         Icons.Default
                             .BluetoothAudio,
+
                     contentDescription =
                         null,
+
                     tint =
                         Purple80
                 )
@@ -420,10 +490,12 @@ private fun ForceLeAudioCard(
                 Text(
                     text =
                         "Experimental LE Audio",
+
                     style =
                         MaterialTheme
                             .typography
                             .titleMedium,
+
                     fontWeight =
                         FontWeight.Bold
                 )
@@ -431,12 +503,15 @@ private fun ForceLeAudioCard(
 
             Text(
                 text =
-                    "Uses Shizuku to ask Samsung's Bluetooth stack " +
-                        "to enable the Buds4 Pro LE Audio profile.",
+                    "Normal Bluetooth runs inside BTMicFix. " +
+                        "Only the privileged LE Audio Binder call " +
+                        "is forwarded through Shizuku.",
+
                 style =
                     MaterialTheme
                         .typography
                         .bodySmall,
+
                 color =
                     MaterialTheme
                         .colorScheme
@@ -446,18 +521,22 @@ private fun ForceLeAudioCard(
             Button(
                 onClick =
                     onForceLeAudio,
+
                 enabled =
                     !isWorking,
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .height(
                             56.dp
                         ),
+
                 shape =
                     RoundedCornerShape(
                         16.dp
                     ),
+
                 colors =
                     ButtonDefaults
                         .buttonColors(
@@ -466,15 +545,14 @@ private fun ForceLeAudioCard(
                         )
             ) {
 
-                if (
-                    isWorking
-                ) {
+                if (isWorking) {
 
                     CircularProgressIndicator(
                         modifier =
                             Modifier.size(
                                 20.dp
                             ),
+
                         strokeWidth =
                             2.dp
                     )
@@ -485,6 +563,7 @@ private fun ForceLeAudioCard(
                         imageVector =
                             Icons.Default
                                 .BluetoothAudio,
+
                         contentDescription =
                             null
                     )
@@ -499,9 +578,12 @@ private fun ForceLeAudioCard(
 
                 Text(
                     if (isWorking) {
-                        "Enabling LE Audio…"
+
+                        "Forcing LE Audio…"
+
                     } else {
-                        "Force LE Audio (Shizuku)"
+
+                        "Force LE Audio (Binder)"
                     }
                 )
             }
@@ -515,6 +597,7 @@ private fun ForceLeAudioCard(
                 Text(
                     text =
                         result,
+
                     style =
                         MaterialTheme
                             .typography
@@ -527,7 +610,7 @@ private fun ForceLeAudioCard(
 
 /*
  * ================================================================
- * NORMAL ROUTING CONTROL
+ * NORMAL ROUTING BUTTON
  * ================================================================
  */
 
@@ -535,10 +618,13 @@ private fun ForceLeAudioCard(
 private fun RoutingControlButton(
     routingState:
         RoutingState,
+
     onEnableRouting:
         () -> Unit,
+
     onDisableRouting:
         () -> Unit,
+
     onRetry:
         () -> Unit
 ) {
@@ -552,16 +638,19 @@ private fun RoutingControlButton(
             Button(
                 onClick =
                     onEnableRouting,
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .height(
                             56.dp
                         ),
+
                 shape =
                     RoundedCornerShape(
                         16.dp
                     ),
+
                 colors =
                     ButtonDefaults
                         .buttonColors(
@@ -574,8 +663,10 @@ private fun RoutingControlButton(
                     imageVector =
                         Icons.Default
                             .PowerSettingsNew,
+
                     contentDescription =
                         null,
+
                     modifier =
                         Modifier.size(
                             20.dp
@@ -591,6 +682,7 @@ private fun RoutingControlButton(
 
                 Text(
                     "Enable Routing",
+
                     style =
                         MaterialTheme
                             .typography
@@ -604,14 +696,17 @@ private fun RoutingControlButton(
             Button(
                 onClick = {
                 },
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .height(
                             56.dp
                         ),
+
                 enabled =
                     false,
+
                 shape =
                     RoundedCornerShape(
                         16.dp
@@ -623,6 +718,7 @@ private fun RoutingControlButton(
                         Modifier.size(
                             20.dp
                         ),
+
                     strokeWidth =
                         2.dp
                 )
@@ -645,12 +741,14 @@ private fun RoutingControlButton(
             OutlinedButton(
                 onClick =
                     onDisableRouting,
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .height(
                             56.dp
                         ),
+
                 shape =
                     RoundedCornerShape(
                         16.dp
@@ -661,6 +759,7 @@ private fun RoutingControlButton(
                     imageVector =
                         Icons.Default
                             .PowerSettingsNew,
+
                     contentDescription =
                         null
                 )
@@ -683,16 +782,19 @@ private fun RoutingControlButton(
             Button(
                 onClick =
                     onRetry,
+
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .height(
                             56.dp
                         ),
+
                 shape =
                     RoundedCornerShape(
                         16.dp
                     ),
+
                 colors =
                     ButtonDefaults
                         .buttonColors(
@@ -709,6 +811,7 @@ private fun RoutingControlButton(
                     imageVector =
                         Icons.Default
                             .Refresh,
+
                     contentDescription =
                         null
                 )
@@ -730,20 +833,22 @@ private fun RoutingControlButton(
 
 /*
  * ================================================================
- * INFO CARD
+ * INFORMATION CARD
  * ================================================================
  */
 
 @Composable
-private fun HowItWorksCard() {
+private fun CurrentExperimentCard() {
 
     Card(
         modifier =
             Modifier.fillMaxWidth(),
+
         shape =
             RoundedCornerShape(
                 16.dp
             ),
+
         colors =
             CardDefaults
                 .cardColors(
@@ -757,6 +862,7 @@ private fun HowItWorksCard() {
                 Modifier.padding(
                     16.dp
                 ),
+
             verticalArrangement =
                 Arrangement
                     .spacedBy(
@@ -767,6 +873,7 @@ private fun HowItWorksCard() {
             Text(
                 text =
                     "Current experiment",
+
                 style =
                     MaterialTheme
                         .typography
@@ -775,15 +882,18 @@ private fun HowItWorksCard() {
 
             Text(
                 text =
-                    "Normal music: Samsung SSC/UHQ.\n\n" +
-                        "Voice microphone: trying to activate " +
-                        "Bluetooth LE Audio instead of HFP/SCO.\n\n" +
-                        "If Samsung accepts LE Audio, the strict " +
-                        "routing manager will detect BLE Headset.",
+                    "Normal music stays on Samsung SSC/UHQ.\n\n" +
+                        "The button asks Android to enable the " +
+                        "Buds4 Pro LE Audio profile using a " +
+                        "Shizuku-wrapped Bluetooth Binder.\n\n" +
+                        "If Samsung creates a BLE Headset route, " +
+                        "the strict AudioRoutingManager will pick it.",
+
                 style =
                     MaterialTheme
                         .typography
                         .bodySmall,
+
                 color =
                     MaterialTheme
                         .colorScheme
