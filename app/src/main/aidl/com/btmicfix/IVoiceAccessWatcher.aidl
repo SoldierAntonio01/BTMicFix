@@ -14,8 +14,7 @@ interface IVoiceAccessWatcher {
 
     boolean isTargetActive() = 3;
 
-    /*
-     * Reserved Shizuku UserService destroy transaction.
-     */
+    String getStatus() = 4;
+
     void destroy() = 16777114;
 }
