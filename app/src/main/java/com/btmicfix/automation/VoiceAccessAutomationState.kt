@@ -5,10 +5,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Shared process-wide status for the Voice Access automation.
- *
- * MainActivity, VoiceAccessMonitorService, and the Compose
- * diagnostic card can all read/write this state.
+ * Shared process-wide diagnostics for Voice Access automation.
  */
 object VoiceAccessAutomationState {
 
@@ -20,6 +17,13 @@ object VoiceAccessAutomationState {
         val userServiceConnected: Boolean = false,
         val voiceAccessUidFound: Boolean = false,
         val watcherRegistered: Boolean = false,
+
+        // New mic-routing diagnostics.
+        val startedWatcherRegistered: Boolean = false,
+        val startingEventSeen: Boolean = false,
+        val capturePreferenceApplied: Boolean = false,
+        val captureAudioSource: Int = -1,
+
         val recordAudioActive: Boolean = false,
         val autoRoutingActive: Boolean = false,
         val lastMessage: String = "Automation has not started yet."

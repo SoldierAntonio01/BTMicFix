@@ -71,16 +71,20 @@ fun VoiceAccessAutomationStatusCard() {
 
             StatusRow(
                 "Notification Access",
-                yesNo(
+                onOff(
                     state.notificationAccessEnabled
                 )
             )
 
             StatusRow(
                 "Host service",
-                running(
+                if (
                     state.hostRunning
-                )
+                ) {
+                    "RUNNING"
+                } else {
+                    "STOPPED"
+                }
             )
 
             StatusRow(
@@ -92,9 +96,13 @@ fun VoiceAccessAutomationStatusCard() {
 
             StatusRow(
                 "Shizuku",
-                ready(
+                if (
                     state.shizukuReady
-                )
+                ) {
+                    "READY"
+                } else {
+                    "WAITING"
+                }
             )
 
             StatusRow(
@@ -116,7 +124,7 @@ fun VoiceAccessAutomationStatusCard() {
             )
 
             StatusRow(
-                "RECORD_AUDIO watcher",
+                "ACTIVE watcher",
                 if (
                     state.watcherRegistered
                 ) {
@@ -124,6 +132,24 @@ fun VoiceAccessAutomationStatusCard() {
                 } else {
                     "NOT REGISTERED"
                 }
+            )
+
+            StatusRow(
+                "STARTING watcher",
+                if (
+                    state.startedWatcherRegistered
+                ) {
+                    "REGISTERED"
+                } else {
+                    "NOT REGISTERED"
+                }
+            )
+
+            StatusRow(
+                "STARTING event seen",
+                yesNo(
+                    state.startingEventSeen
+                )
             )
 
             StatusRow(
@@ -138,7 +164,25 @@ fun VoiceAccessAutomationStatusCard() {
             )
 
             StatusRow(
-                "Automatic BLE route",
+                "BLE mic capture preference",
+                if (
+                    state.capturePreferenceApplied
+                ) {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            )
+
+            StatusRow(
+                "Capture source",
+                audioSourceName(
+                    state.captureAudioSource
+                )
+            )
+
+            StatusRow(
+                "Communication BLE route",
                 if (
                     state.autoRoutingActive
                 ) {
@@ -215,25 +259,16 @@ private fun StatusRow(
     }
 }
 
-private fun yesNo(
+private fun onOff(
     value: Boolean
 ): String {
 
-    return if (value) {
+    return if (
+        value
+    ) {
         "ON"
     } else {
         "OFF"
-    }
-}
-
-private fun running(
-    value: Boolean
-): String {
-
-    return if (value) {
-        "RUNNING"
-    } else {
-        "STOPPED"
     }
 }
 
@@ -241,20 +276,61 @@ private fun connected(
     value: Boolean
 ): String {
 
-    return if (value) {
+    return if (
+        value
+    ) {
         "CONNECTED"
     } else {
         "WAITING"
     }
 }
 
-private fun ready(
+private fun yesNo(
     value: Boolean
 ): String {
 
-    return if (value) {
-        "READY"
+    return if (
+        value
+    ) {
+        "YES"
     } else {
-        "WAITING"
+        "NO"
+    }
+}
+
+private fun audioSourceName(
+    source: Int
+): String {
+
+    return when (
+        source
+    ) {
+
+        -1 ->
+            "UNKNOWN"
+
+        0 ->
+            "DEFAULT"
+
+        1 ->
+            "MIC"
+
+        5 ->
+            "CAMCORDER"
+
+        6 ->
+            "VOICE_RECOGNITION"
+
+        7 ->
+            "VOICE_COMMUNICATION"
+
+        9 ->
+            "UNPROCESSED"
+
+        10 ->
+            "VOICE_PERFORMANCE"
+
+        else ->
+            "AudioSource $source"
     }
 }
