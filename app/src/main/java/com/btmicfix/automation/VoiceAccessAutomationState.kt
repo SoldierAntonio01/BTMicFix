@@ -24,6 +24,12 @@ object VoiceAccessAutomationState {
         val capturePreferenceApplied: Boolean = false,
         val captureAudioSource: Int = -1,
 
+        // Actual microphone endpoint discovered from
+        // AudioManager.GET_DEVICES_INPUTS.
+        val actualBleInputFound: Boolean = false,
+        val actualBleInputType: Int = -1,
+        val actualBleInputName: String = "",
+
         val recordAudioActive: Boolean = false,
         val autoRoutingActive: Boolean = false,
         val lastMessage: String = "Automation has not started yet."

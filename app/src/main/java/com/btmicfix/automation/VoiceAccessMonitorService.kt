@@ -3,6 +3,8 @@ package com.btmicfix.automation
 import android.content.ComponentName
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -194,6 +196,42 @@ class VoiceAccessMonitorService :
                     turnRoutingOn()
 
                     /*
+                     * Now that the BLE communication route has been
+                     * selected, ask Android for the REAL connected
+                     * microphone input and apply it to Voice Access.
+                     *
+                     * Samsung can expose the input a few milliseconds
+                     * after the output route changes, so make a tiny
+                     * one-shot burst of retries. This is NOT a
+                     * permanent polling loop.
+                     */
+                    refreshActualBleInputAndCapturePreference()
+
+                    mainHandler.postDelayed(
+                        {
+                            if (
+                                routeRequested ||
+                                voiceAccessActive
+                            ) {
+                                refreshActualBleInputAndCapturePreference()
+                            }
+                        },
+                        BLE_INPUT_RETRY_1_MS
+                    )
+
+                    mainHandler.postDelayed(
+                        {
+                            if (
+                                routeRequested ||
+                                voiceAccessActive
+                            ) {
+                                refreshActualBleInputAndCapturePreference()
+                            }
+                        },
+                        BLE_INPUT_RETRY_2_MS
+                    )
+
+                    /*
                      * Failed app-op starts do not necessarily produce
                      * a later ACTIVE -> INACTIVE pair.
                      */
@@ -239,6 +277,17 @@ class VoiceAccessMonitorService :
                     applyVoiceAccessState(
                         active
                     )
+
+                    if (
+                        active
+                    ) {
+                        /*
+                         * ACTIVE is authoritative. Re-read the actual
+                         * BLE microphone once more now that Voice
+                         * Access definitely owns an AudioRecord.
+                         */
+                        refreshActualBleInputAndCapturePreference()
+                    }
                 }
             }
 
@@ -383,31 +432,48 @@ class VoiceAccessMonitorService :
 
                 /*
                  * =================================================
-                 * BLE TARGET
+                 * ACTUAL BLE MICROPHONE INPUT
                  * =================================================
                  *
-                 * availableCommunicationDevices returns the BLE
-                 * communication endpoint. AudioDeviceAttributes can
-                 * use the same public device type + address with
-                 * ROLE_INPUT in the privileged process.
+                 * IMPORTANT:
+                 *
+                 * availableCommunicationDevices contains communication
+                 * SINKS / outputs. Capture routing needs the real SOURCE
+                 * returned by AudioManager.GET_DEVICES_INPUTS.
                  */
 
-                val ble =
-                    routingManager
-                        .findFirstBluetoothCommunicationDevice()
+                val bleInput =
+                    findActualBleInputDevice()
 
                 val bleType =
-                    ble
+                    bleInput
                         ?.type
                         ?: -1
 
                 val bleAddress =
-                    ble
+                    bleInput
                         ?.address
                         ?: ""
 
+                VoiceAccessAutomationState.update {
+
+                    it.copy(
+                        actualBleInputFound =
+                            bleInput != null,
+
+                        actualBleInputType =
+                            bleType,
+
+                        actualBleInputName =
+                            bleInput
+                                ?.productName
+                                ?.toString()
+                                ?: ""
+                    )
+                }
+
                 if (
-                    ble ==
+                    bleInput ==
                     null
                 ) {
 
@@ -415,7 +481,7 @@ class VoiceAccessMonitorService :
 
                         it.copy(
                             lastMessage =
-                                "AppOps watcher can start, but BLE Headset / LE Audio is not currently available."
+                                "Watchers can start, but Android has not exposed the real BLE microphone input yet."
                         )
                     }
                 }
@@ -907,6 +973,190 @@ class VoiceAccessMonitorService :
 
     /*
      * ============================================================
+     * REAL BLE MICROPHONE INPUT
+     * ============================================================
+     *
+     * availableCommunicationDevices contains communication sinks.
+     * This method asks Android specifically for INPUT devices.
+     */
+
+    private fun findActualBleInputDevice():
+        AudioDeviceInfo? {
+
+        val manager =
+            applicationContext
+                .getSystemService(
+                    AudioManager::class.java
+                )
+                ?: return null
+
+        val inputs =
+            try {
+
+                manager.getDevices(
+                    AudioManager.GET_DEVICES_INPUTS
+                )
+
+            } catch (e: Throwable) {
+
+                Logger.e(
+                    "Could not enumerate audio input devices",
+                    e
+                )
+
+                return null
+            }
+
+        /*
+         * Prefer the Buds if more than one LE headset exists.
+         */
+
+        inputs
+            .firstOrNull {
+
+                it.isSource &&
+                    it.type ==
+                    AudioDeviceInfo.TYPE_BLE_HEADSET &&
+                    (
+                        it.productName
+                            ?.toString()
+                            ?.contains(
+                                "Buds",
+                                ignoreCase = true
+                            )
+                            == true
+                        )
+            }
+            ?.let {
+
+                return it
+            }
+
+        /*
+         * Otherwise use the first real BLE Headset SOURCE.
+         */
+
+        return inputs
+            .firstOrNull {
+
+                it.isSource &&
+                    it.type ==
+                    AudioDeviceInfo.TYPE_BLE_HEADSET
+            }
+    }
+
+    /*
+     * ============================================================
+     * APPLY REAL BLE MICROPHONE TO VOICE ACCESS
+     * ============================================================
+     */
+
+    private fun refreshActualBleInputAndCapturePreference() {
+
+        val remote =
+            watcher
+                ?: return
+
+        val input =
+            findActualBleInputDevice()
+
+        if (
+            input ==
+            null
+        ) {
+
+            VoiceAccessAutomationState.update {
+
+                it.copy(
+                    actualBleInputFound =
+                        false,
+
+                    actualBleInputType =
+                        -1,
+
+                    actualBleInputName =
+                        "",
+
+                    capturePreferenceApplied =
+                        false,
+
+                    lastMessage =
+                        "BLE route is on, but Android has not exposed a TYPE_BLE_HEADSET microphone input."
+                )
+            }
+
+            return
+        }
+
+        VoiceAccessAutomationState.update {
+
+            it.copy(
+                actualBleInputFound =
+                    true,
+
+                actualBleInputType =
+                    input.type,
+
+                actualBleInputName =
+                    input
+                        .productName
+                        ?.toString()
+                        ?: "BLE Headset",
+
+                lastMessage =
+                    "Real BLE microphone input found. Applying it to Voice Access."
+            )
+        }
+
+        try {
+
+            remote.updateBleInputTarget(
+                input.type,
+                input.address
+            )
+
+            val applied =
+                remote.refreshCapturePreference()
+
+            VoiceAccessAutomationState.update {
+
+                it.copy(
+                    capturePreferenceApplied =
+                        applied,
+
+                    lastMessage =
+                        if (
+                            applied
+                        ) {
+                            "Real BLE microphone input is preferred for Voice Access capture."
+                        } else {
+                            "Real BLE microphone was found, but Android audio policy rejected the capture preference."
+                        }
+                )
+            }
+
+        } catch (e: Throwable) {
+
+            VoiceAccessAutomationState.update {
+
+                it.copy(
+                    capturePreferenceApplied =
+                        false,
+
+                    lastMessage =
+                        "Could not apply real BLE microphone input: ${e.javaClass.simpleName}: ${e.message}"
+                )
+            }
+
+            Logger.e(
+                "Could not refresh Voice Access BLE microphone input",
+                e
+            )
+        }
+    }
+
+    /*
+     * ============================================================
      * AUTHORITATIVE ACTIVE STATE
      * ============================================================
      */
@@ -1286,11 +1536,17 @@ class VoiceAccessMonitorService :
         private const val REBIND_DELAY_MS =
             1500L
 
+        private const val BLE_INPUT_RETRY_1_MS =
+            120L
+
+        private const val BLE_INPUT_RETRY_2_MS =
+            350L
+
         /*
-         * Bumped so Shizuku definitely loads this microphone-routing
-         * implementation instead of the previous UserService.
+         * Bumped so Shizuku definitely loads this real-input
+         * microphone-routing implementation.
          */
         private const val WATCHER_SERVICE_VERSION =
-            6
+            7
     }
 }

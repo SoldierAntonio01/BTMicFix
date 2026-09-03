@@ -31,6 +31,23 @@ interface IVoiceAccessWatcher {
     void clearCapturePreference() = 5;
 
     /**
+     * Update the actual connected BLE INPUT endpoint.
+     *
+     * This must come from AudioManager.GET_DEVICES_INPUTS, not from
+     * availableCommunicationDevices (which contains communication sinks).
+     */
+    String updateBleInputTarget(
+        int bleInputDeviceType,
+        String bleInputAddress
+    ) = 6;
+
+    /**
+     * Re-detect Voice Access's active capture preset and apply the
+     * currently supplied BLE input to it.
+     */
+    boolean refreshCapturePreference() = 7;
+
+    /**
      * Reserved Shizuku UserService destroy transaction.
      */
     void destroy() = 16777114;

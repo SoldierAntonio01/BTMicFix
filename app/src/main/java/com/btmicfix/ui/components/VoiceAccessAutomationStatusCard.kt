@@ -153,6 +153,24 @@ fun VoiceAccessAutomationStatusCard() {
             )
 
             StatusRow(
+                "Actual BLE microphone",
+                if (
+                    state.actualBleInputFound
+                ) {
+                    "FOUND"
+                } else {
+                    "NOT FOUND"
+                }
+            )
+
+            StatusRow(
+                "BLE input type",
+                audioDeviceTypeName(
+                    state.actualBleInputType
+                )
+            )
+
+            StatusRow(
                 "Voice Access RECORD_AUDIO",
                 if (
                     state.recordAudioActive
@@ -295,6 +313,28 @@ private fun yesNo(
         "YES"
     } else {
         "NO"
+    }
+}
+
+private fun audioDeviceTypeName(
+    type: Int
+): String {
+
+    return when (
+        type
+    ) {
+
+        -1 ->
+            "UNKNOWN"
+
+        26 ->
+            "BLE_HEADSET"
+
+        7 ->
+            "BLUETOOTH_SCO"
+
+        else ->
+            "Type $type"
     }
 }
 

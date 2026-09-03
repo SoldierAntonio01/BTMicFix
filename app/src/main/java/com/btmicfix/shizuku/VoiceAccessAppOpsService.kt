@@ -1239,6 +1239,70 @@ class VoiceAccessAppOpsService() :
      * ============================================================
      */
 
+    /*
+     * ============================================================
+     * UPDATE REAL BLE INPUT TARGET
+     * ============================================================
+     *
+     * Called by the normal BTMicFix process after it enumerates
+     * AudioManager.GET_DEVICES_INPUTS and finds the real
+     * TYPE_BLE_HEADSET source.
+     */
+
+    override fun updateBleInputTarget(
+        bleInputDeviceType: Int,
+        bleInputAddress: String
+    ): String {
+
+        synchronized(lock) {
+
+            this.bleInputDeviceType =
+                bleInputDeviceType
+
+            this.bleInputAddress =
+                bleInputAddress
+
+            lastError =
+                "NONE"
+
+            return buildStatus(
+                "BLE INPUT TARGET UPDATED"
+            )
+        }
+    }
+
+    /*
+     * ============================================================
+     * RE-APPLY CAPTURE PREFERENCE NOW
+     * ============================================================
+     *
+     * Useful after Samsung exposes the BLE input a moment after
+     * setCommunicationDevice() is accepted.
+     */
+
+    override fun refreshCapturePreference():
+        Boolean {
+
+        synchronized(lock) {
+
+            val source =
+                discoverTargetRecordingSource()
+                    ?: AUDIO_SOURCE_VOICE_RECOGNITION
+
+            val applied =
+                applyBleCapturePreference(
+                    source
+                )
+
+            sendCaptureRoutingState(
+                applied,
+                source
+            )
+
+            return applied
+        }
+    }
+
     override fun clearCapturePreference() {
 
         synchronized(lock) {
