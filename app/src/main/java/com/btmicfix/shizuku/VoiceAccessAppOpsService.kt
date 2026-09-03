@@ -2,27 +2,40 @@ package com.btmicfix.shizuku
 
 import android.app.AppOpsManager
 import android.content.Context
+import android.os.Process
 import androidx.annotation.Keep
 import com.btmicfix.IVoiceAccessOpCallback
 import com.btmicfix.IVoiceAccessWatcher
+import rikka.shizuku.SystemServiceHelper
 import java.lang.reflect.InvocationTargetException
-import java.lang.reflect.Proxy
 import java.util.concurrent.Executor
 
 /**
- * Privileged Voice Access microphone-state watcher.
+ * BTMicFix privileged Voice Access microphone watcher.
  *
- * Runs as a Shizuku UserService.
+ * Runs inside a Shizuku UserService.
  *
- * It watches Voice Access's RECORD_AUDIO AppOp.
+ * Watches:
  *
- * Voice Access starts listening:
- *      RECORD_AUDIO = ACTIVE
+ * android:record_audio
  *
- * Voice Access stops listening:
- *      RECORD_AUDIO = INACTIVE
+ * specifically for Google's Voice Access package.
+ *
+ *
+ * Voice Access listening:
+ *
+ * RECORD_AUDIO = ACTIVE
+ *
+ *
+ * Voice Access stopped:
+ *
+ * RECORD_AUDIO = INACTIVE
+ *
+ *
+ * IMPORTANT:
  *
  * This is event-driven.
+ *
  * There is NO repeating polling loop.
  */
 @Keep
@@ -35,21 +48,69 @@ class VoiceAccessAppOpsService() :
      * ============================================================
      */
 
-    private var serviceContext:
+    private var suppliedContext:
         Context? =
         null
 
     /*
-     * Shizuku can construct the UserService with a Context.
+     * Shizuku API 13+ may create the UserService
+     * using this Context constructor.
      */
     @Keep
     constructor(
         context: Context
     ) : this() {
 
-        serviceContext =
+        suppliedContext =
             context
     }
+
+    /*
+     * ============================================================
+     * LOCK
+     * ============================================================
+     */
+
+    private val lock =
+        Any()
+
+    /*
+     * ============================================================
+     * APPOPS
+     * ============================================================
+     */
+
+    private var appOpsManager:
+        AppOpsManager? =
+        null
+
+    private var activeListener:
+        AppOpsManager.OnOpActiveChangedListener? =
+        null
+
+    /*
+     * ============================================================
+     * TARGET
+     * ============================================================
+     */
+
+    private var targetUid:
+        Int =
+        -1
+
+    private var targetPackage:
+        String =
+        ""
+
+    /*
+     * ============================================================
+     * CALLBACK TO NORMAL BTMICFIX PROCESS
+     * ============================================================
+     */
+
+    private var clientCallback:
+        IVoiceAccessOpCallback? =
+        null
 
     /*
      * ============================================================
@@ -57,34 +118,45 @@ class VoiceAccessAppOpsService() :
      * ============================================================
      */
 
-    private val lock =
-        Any()
-
-    private var appOpsManager:
-        AppOpsManager? =
-        null
-
-    private var listener:
-        Any? =
-        null
-
-    private var clientCallback:
-        IVoiceAccessOpCallback? =
-        null
-
-    private var targetUid =
-        -1
-
-    private var targetPackage =
-        ""
+    @Volatile
+    private var currentActive:
+        Boolean =
+        false
 
     @Volatile
-    private var targetActive =
+    private var watcherRegistered:
+        Boolean =
         false
 
     /*
-     * Run the tiny AppOps callback immediately.
+     * ============================================================
+     * DIAGNOSTICS
+     * ============================================================
      */
+
+    private var contextSource:
+        String =
+        "NONE"
+
+    private var managerSource:
+        String =
+        "NONE"
+
+    private var lastError:
+        String =
+        "NONE"
+
+    /*
+     * ============================================================
+     * CALLBACK EXECUTOR
+     * ============================================================
+     *
+     * AppOps callbacks are tiny.
+     *
+     * Run immediately on the dispatching thread rather than
+     * creating another permanent worker.
+     */
+
     private val directExecutor =
         Executor { runnable ->
 
@@ -106,8 +178,9 @@ class VoiceAccessAppOpsService() :
         synchronized(lock) {
 
             /*
-             * Remove any older listener.
+             * Remove any old registration first.
              */
+
             stopWatchLocked()
 
             this.targetUid =
@@ -119,431 +192,201 @@ class VoiceAccessAppOpsService() :
             this.clientCallback =
                 callback
 
+            lastError =
+                "NONE"
+
             /*
-             * Get AppOpsManager from the Shizuku process.
+             * ====================================================
+             * GET APPOPS MANAGER
+             * ====================================================
              */
+
             val manager =
-                getAppOpsManager()
-                    ?: return """
-                        ===== BTMicFix VOICE ACCESS APPOPS =====
-                        FAILED
+                obtainAppOpsManager()
 
-                        AppOpsManager unavailable inside
-                        the Shizuku UserService.
+            if (
+                manager == null
+            ) {
 
-                        ========================================
-                    """.trimIndent()
+                lastError =
+                    "Could not obtain AppOpsManager."
 
-            /*
-             * ====================================================
-             * HIDDEN LISTENER INTERFACE
-             * ====================================================
-             *
-             * Compile SDK 34 doesn't expose this interface,
-             * so load it by class name.
-             */
-
-            val listenerClass =
-                try {
-
-                    Class.forName(
-                        "android.app.AppOpsManager" +
-                            "\$OnOpActiveChangedListener"
-                    )
-
-                } catch (e: Throwable) {
-
-                    return failure(
-                        "OnOpActiveChangedListener unavailable.",
-                        e
-                    )
-                }
-
-            /*
-             * ====================================================
-             * CREATE LISTENER PROXY
-             * ====================================================
-             */
-
-            val proxy =
-                try {
-
-                    Proxy.newProxyInstance(
-                        listenerClass.classLoader
-                            ?: javaClass.classLoader,
-
-                        arrayOf(
-                            listenerClass
-                        )
-                    ) {
-                            proxyObject,
-                            method,
-                            args ->
-
-                        when (method.name) {
-
-                            "hashCode" -> {
-
-                                System.identityHashCode(
-                                    proxyObject
-                                )
-                            }
-
-                            "equals" -> {
-
-                                proxyObject ===
-                                    args?.getOrNull(0)
-                            }
-
-                            "toString" -> {
-
-                                "BTMicFixVoiceAccessAppOpsListener"
-                            }
-
-                            "onOpActiveChanged" -> {
-
-                                handleActiveCallback(
-                                    args
-                                )
-
-                                null
-                            }
-
-                            else -> {
-
-                                null
-                            }
-                        }
-                    }
-
-                } catch (e: Throwable) {
-
-                    return failure(
-                        "Could not create AppOps listener.",
-                        e
-                    )
-                }
-
-            listener =
-                proxy
-
-            /*
-             * ====================================================
-             * FIND startWatchingActive()
-             * ====================================================
-             *
-             * Expected Android form:
-             *
-             * startWatchingActive(
-             *     String[] ops,
-             *     Executor executor,
-             *     OnOpActiveChangedListener listener
-             * )
-             */
-
-            val startMethod =
-                manager
-                    .javaClass
-                    .methods
-                    .firstOrNull {
-                            method ->
-
-                        val types =
-                            method.parameterTypes
-
-                        method.name ==
-                            "startWatchingActive" &&
-
-                            types.size ==
-                            3 &&
-
-                            types[0].isArray &&
-
-                            types[0].componentType ==
-                            String::class.java &&
-
-                            Executor::class.java
-                                .isAssignableFrom(
-                                    types[1]
-                                ) &&
-
-                            types[2].name ==
-                            listenerClass.name
-                    }
-
-            if (startMethod == null) {
-
-                listener =
-                    null
-
-                clientCallback =
-                    null
-
-                return """
-                    ===== BTMicFix VOICE ACCESS APPOPS =====
-                    FAILED
-
-                    Samsung did not expose the expected:
-
-                    startWatchingActive(
-                        String[],
-                        Executor,
-                        OnOpActiveChangedListener
-                    )
-
-                    ========================================
-                """.trimIndent()
+                return buildStatus(
+                    "FAILED"
+                )
             }
 
             /*
              * ====================================================
-             * REGISTER WATCHER
+             * CREATE ACTIVE LISTENER
+             * ====================================================
+             */
+
+            val listener =
+                object :
+                    AppOpsManager.OnOpActiveChangedListener {
+
+                    override fun onOpActiveChanged(
+                        op: String,
+                        uid: Int,
+                        packageName: String,
+                        active: Boolean
+                    ) {
+
+                        /*
+                         * Only RECORD_AUDIO matters.
+                         */
+
+                        if (
+                            op !=
+                            AppOpsManager.OPSTR_RECORD_AUDIO
+                        ) {
+
+                            return
+                        }
+
+                        /*
+                         * Only our Voice Access UID matters.
+                         */
+
+                        if (
+                            uid !=
+                            this@VoiceAccessAppOpsService.targetUid
+                        ) {
+
+                            return
+                        }
+
+                        /*
+                         * Only Google's Voice Access package matters.
+                         */
+
+                        if (
+                            packageName !=
+                            this@VoiceAccessAppOpsService.targetPackage
+                        ) {
+
+                            return
+                        }
+
+                        /*
+                         * Prefer Android's aggregate state if its
+                         * hidden isOpActive() method is accessible.
+                         *
+                         * Otherwise use the state Android supplied
+                         * directly in this callback.
+                         */
+
+                        val aggregateState =
+                            queryCurrentState()
+
+                        val finalState =
+                            aggregateState
+                                ?: active
+
+                        sendState(
+                            finalState
+                        )
+                    }
+                }
+
+            /*
+             * ====================================================
+             * REGISTER APPOPS WATCH
              * ====================================================
              */
 
             try {
 
-                startMethod.isAccessible =
-                    true
-
-                startMethod.invoke(
-                    manager,
+                manager.startWatchingActive(
                     arrayOf(
-                        RECORD_AUDIO_OP
+                        AppOpsManager.OPSTR_RECORD_AUDIO
                     ),
                     directExecutor,
-                    proxy
+                    listener
                 )
+
+                activeListener =
+                    listener
+
+                watcherRegistered =
+                    true
 
             } catch (e: Throwable) {
 
-                listener =
+                activeListener =
                     null
 
-                clientCallback =
-                    null
+                watcherRegistered =
+                    false
 
-                return failure(
-                    "startWatchingActive() failed.",
-                    unwrap(e)
+                lastError =
+                    "startWatchingActive failed: " +
+                        describeThrowable(
+                            e
+                        )
+
+                return buildStatus(
+                    "WATCH REGISTRATION FAILED"
                 )
             }
 
             /*
              * ====================================================
-             * CURRENT STATE
+             * GET INITIAL STATE
              * ====================================================
              *
-             * Voice Access might already be listening when this
-             * service starts.
+             * Voice Access may already be listening before our
+             * UserService starts.
              */
 
             val initialState =
-                queryActive(
-                    manager
-                )
+                queryCurrentState()
                     ?: false
 
             /*
-             * Force initial state to the normal app process.
+             * Force one initial callback into BTMicFix.
              */
+
             sendState(
                 initialState,
-                force = true
+                force =
+                    true
             )
 
-            return """
-                ===== BTMicFix VOICE ACCESS APPOPS =====
-                WATCH ACTIVE
-
-                Package:
-                $targetPackage
-
-                UID:
-                $targetUid
-
-                Watching:
-                RECORD_AUDIO
-
-                Current:
-                ${
-                    if (initialState) {
-                        "ACTIVE"
-                    } else {
-                        "INACTIVE"
-                    }
-                }
-
-                Polling:
-                NONE
-
-                ========================================
-            """.trimIndent()
+            return buildStatus(
+                "WATCH ACTIVE"
+            )
         }
     }
 
     /*
      * ============================================================
-     * APPOPS CALLBACK
+     * QUERY CURRENT APPOPS STATE
      * ============================================================
+     *
+     * isOpActive() is not something we want to depend on at
+     * compile time across Samsung/Android versions.
+     *
+     * Call it reflectively.
      */
 
-    private fun handleActiveCallback(
-        args:
-            Array<out Any?>?
-    ) {
+    private fun queryCurrentState():
+        Boolean? {
 
-        if (
-            args == null ||
-            args.size < 3
-        ) {
-
-            return
-        }
-
-        /*
-         * Modern AppOps callback begins with:
-         *
-         * String op
-         * int uid
-         * String packageName
-         */
-
-        val op =
-            args.getOrNull(0)
-                as? String
-                ?: return
-
-        val uid =
-            (
-                args.getOrNull(1)
-                    as? Number
-                )
-                ?.toInt()
-                ?: return
-
-        val packageName =
-            args.getOrNull(2)
-                as? String
-                ?: return
-
-        /*
-         * Ignore every operation except RECORD_AUDIO.
-         */
-
-        if (
-            op !=
-            RECORD_AUDIO_OP
-        ) {
-
-            return
-        }
-
-        /*
-         * Ignore every UID except Voice Access.
-         */
-
-        if (
-            uid !=
-            targetUid
-        ) {
-
-            return
-        }
-
-        /*
-         * Ignore every package except Voice Access.
-         */
-
-        if (
-            packageName !=
-            targetPackage
-        ) {
-
-            return
-        }
-
-        /*
-         * ========================================================
-         * FIND ACTUAL ACTIVE STATE
-         * ========================================================
-         *
-         * Prefer the aggregate AppOps state.
-         */
-
-        val aggregate =
+        val manager =
             appOpsManager
-                ?.let {
-
-                    queryActive(it)
-                }
-
-        /*
-         * Fallback:
-         *
-         * Samsung's callback should include a Boolean somewhere
-         * representing active/inactive.
-         */
-
-        val callbackValue =
-            args
-                .firstOrNull {
-
-                    it is Boolean
-                } as? Boolean
-
-        val active =
-            aggregate
-                ?: callbackValue
-                ?: return
-
-        sendState(
-            active
-        )
-    }
-
-    /*
-     * ============================================================
-     * QUERY CURRENT STATE
-     * ============================================================
-     */
-
-    override fun isTargetActive():
-        Boolean {
-
-        synchronized(lock) {
-
-            val manager =
-                appOpsManager
-                    ?: getAppOpsManager()
-                    ?: return targetActive
-
-            val active =
-                queryActive(
-                    manager
-                )
-                    ?: targetActive
-
-            targetActive =
-                active
-
-            return active
-        }
-    }
-
-    /*
-     * ============================================================
-     * HIDDEN isOpActive()
-     * ============================================================
-     */
-
-    private fun queryActive(
-        manager:
-            AppOpsManager
-    ): Boolean? {
+                ?: return null
 
         if (
-            targetUid < 0 ||
+            targetUid <
+            0
+        ) {
+
+            return false
+        }
+
+        if (
             targetPackage.isBlank()
         ) {
 
@@ -551,6 +394,16 @@ class VoiceAccessAppOpsService() :
         }
 
         return try {
+
+            /*
+             * Look for:
+             *
+             * isOpActive(
+             *     String op,
+             *     int uid,
+             *     String packageName
+             * )
+             */
 
             val method =
                 manager
@@ -577,19 +430,38 @@ class VoiceAccessAppOpsService() :
                             types[2] ==
                             String::class.java
                     }
-                    ?: return null
+
+            if (
+                method == null
+            ) {
+
+                return null
+            }
 
             method.isAccessible =
                 true
 
             method.invoke(
                 manager,
-                RECORD_AUDIO_OP,
+                AppOpsManager.OPSTR_RECORD_AUDIO,
                 targetUid,
                 targetPackage
             ) as? Boolean
 
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
+
+            /*
+             * Not fatal.
+             *
+             * onOpActiveChanged() already provides the Boolean
+             * active state, so this is only an extra verification.
+             */
+
+            lastError =
+                "isOpActive unavailable: " +
+                    describeThrowable(
+                        e
+                    )
 
             null
         }
@@ -597,7 +469,7 @@ class VoiceAccessAppOpsService() :
 
     /*
      * ============================================================
-     * SEND STATE TO BTMICFIX
+     * SEND STATE TO MAIN BTMICFIX PROCESS
      * ============================================================
      */
 
@@ -608,19 +480,19 @@ class VoiceAccessAppOpsService() :
     ) {
 
         /*
-         * Avoid duplicate callbacks.
+         * Don't send duplicate events.
          */
 
         if (
             !force &&
             active ==
-            targetActive
+            currentActive
         ) {
 
             return
         }
 
-        targetActive =
+        currentActive =
             active
 
         try {
@@ -630,14 +502,96 @@ class VoiceAccessAppOpsService() :
                     active
                 )
 
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
 
             /*
-             * Main BTMicFix process may have died.
+             * Main BTMicFix process may have been killed or
+             * restarted.
              */
+
+            lastError =
+                "Client callback failed: " +
+                    describeThrowable(
+                        e
+                    )
 
             clientCallback =
                 null
+        }
+    }
+
+    /*
+     * ============================================================
+     * CURRENT STATE REQUESTED BY MAIN APP
+     * ============================================================
+     */
+
+    override fun isTargetActive():
+        Boolean {
+
+        synchronized(lock) {
+
+            val actual =
+                queryCurrentState()
+
+            if (
+                actual != null
+            ) {
+
+                currentActive =
+                    actual
+            }
+
+            return currentActive
+        }
+    }
+
+    /*
+     * ============================================================
+     * GET STATUS
+     * ============================================================
+     *
+     * THIS METHOD IS REQUIRED BY:
+     *
+     * IVoiceAccessWatcher.aidl
+     *
+     * String getStatus() = 4;
+     *
+     * This is the exact method your failed build was missing.
+     */
+
+    override fun getStatus():
+        String {
+
+        synchronized(lock) {
+
+            /*
+             * Refresh state for diagnostics if possible.
+             */
+
+            val actual =
+                queryCurrentState()
+
+            if (
+                actual != null
+            ) {
+
+                currentActive =
+                    actual
+            }
+
+            return buildStatus(
+                if (
+                    watcherRegistered
+                ) {
+
+                    "WATCH ACTIVE"
+
+                } else {
+
+                    "WATCH NOT ACTIVE"
+                }
+            )
         }
     }
 
@@ -655,56 +609,46 @@ class VoiceAccessAppOpsService() :
         }
     }
 
+    /*
+     * ============================================================
+     * INTERNAL STOP
+     * ============================================================
+     */
+
     private fun stopWatchLocked() {
 
         val manager =
             appOpsManager
 
-        val oldListener =
-            listener
+        val listener =
+            activeListener
 
         if (
             manager != null &&
-            oldListener != null
+            listener != null
         ) {
 
             try {
 
-                val stopMethod =
-                    manager
-                        .javaClass
-                        .methods
-                        .firstOrNull {
-                                method ->
+                manager.stopWatchingActive(
+                    listener
+                )
 
-                            method.name ==
-                                "stopWatchingActive" &&
+            } catch (e: Throwable) {
 
-                            method
-                                .parameterTypes
-                                .size ==
-                                1
-                        }
-
-                if (
-                    stopMethod != null
-                ) {
-
-                    stopMethod.isAccessible =
-                        true
-
-                    stopMethod.invoke(
-                        manager,
-                        oldListener
-                    )
-                }
-
-            } catch (_: Throwable) {
+                lastError =
+                    "stopWatchingActive failed: " +
+                        describeThrowable(
+                            e
+                        )
             }
         }
 
-        listener =
+        activeListener =
             null
+
+        watcherRegistered =
+            false
 
         clientCallback =
             null
@@ -715,7 +659,7 @@ class VoiceAccessAppOpsService() :
         targetPackage =
             ""
 
-        targetActive =
+        currentActive =
             false
     }
 
@@ -725,8 +669,12 @@ class VoiceAccessAppOpsService() :
      * ============================================================
      */
 
-    private fun getAppOpsManager():
+    private fun obtainAppOpsManager():
         AppOpsManager? {
+
+        /*
+         * Already available.
+         */
 
         appOpsManager
             ?.let {
@@ -734,26 +682,464 @@ class VoiceAccessAppOpsService() :
                 return it
             }
 
+        /*
+         * ========================================================
+         * GET A USABLE CONTEXT
+         * ========================================================
+         */
+
         val context =
-            serviceContext
-                ?: return null
+            obtainUsableContext()
 
-        val manager =
-            try {
+        if (
+            context == null
+        ) {
 
+            lastError =
+                "No usable Context inside Shizuku UserService."
+
+            return null
+        }
+
+        /*
+         * ========================================================
+         * METHOD 1
+         *
+         * Normal Context.getSystemService()
+         * ========================================================
+         */
+
+        try {
+
+            val manager =
                 context.getSystemService(
                     AppOpsManager::class.java
                 )
 
-            } catch (_: Throwable) {
+            if (
+                manager != null
+            ) {
 
-                null
+                appOpsManager =
+                    manager
+
+                managerSource =
+                    "Context.getSystemService"
+
+                return manager
             }
 
-        appOpsManager =
-            manager
+        } catch (e: Throwable) {
 
-        return manager
+            lastError =
+                "Context AppOpsManager failed: " +
+                    describeThrowable(
+                        e
+                    )
+        }
+
+        /*
+         * ========================================================
+         * METHOD 2
+         *
+         * RAW ANDROID "appops" BINDER
+         * ========================================================
+         *
+         * Shizuku UserService is not a normal Android application
+         * process.
+         *
+         * If Context.getSystemService() fails, obtain the raw
+         * system Binder and construct AppOpsManager ourselves.
+         */
+
+        try {
+
+            val binder =
+                SystemServiceHelper
+                    .getSystemService(
+                        Context.APP_OPS_SERVICE
+                    )
+
+            if (
+                binder == null
+            ) {
+
+                lastError =
+                    "Raw appops Binder returned NULL."
+
+                return null
+            }
+
+            /*
+             * ====================================================
+             * IAppOpsService.Stub.asInterface()
+             * ====================================================
+             */
+
+            val stubClass =
+                Class.forName(
+                    "com.android.internal.app.IAppOpsService\$Stub"
+                )
+
+            val asInterfaceMethod =
+                stubClass
+                    .methods
+                    .firstOrNull {
+                            method ->
+
+                        method.name ==
+                            "asInterface" &&
+
+                            method.parameterTypes.size ==
+                            1
+                    }
+
+            if (
+                asInterfaceMethod == null
+            ) {
+
+                lastError =
+                    "IAppOpsService.Stub.asInterface not found."
+
+                return null
+            }
+
+            asInterfaceMethod.isAccessible =
+                true
+
+            val internalService =
+                asInterfaceMethod.invoke(
+                    null,
+                    binder
+                )
+
+            if (
+                internalService == null
+            ) {
+
+                lastError =
+                    "IAppOpsService interface returned NULL."
+
+                return null
+            }
+
+            /*
+             * ====================================================
+             * HIDDEN APPOPSMANAGER CONSTRUCTOR
+             * ====================================================
+             *
+             * AppOpsManager(
+             *     Context,
+             *     IAppOpsService
+             * )
+             */
+
+            val constructor =
+                AppOpsManager::class.java
+                    .declaredConstructors
+                    .firstOrNull {
+                            ctor ->
+
+                        val types =
+                            ctor.parameterTypes
+
+                        types.size ==
+                            2 &&
+
+                            Context::class.java
+                                .isAssignableFrom(
+                                    types[0]
+                                ) &&
+
+                            types[1].name ==
+                            "com.android.internal.app.IAppOpsService"
+                    }
+
+            if (
+                constructor == null
+            ) {
+
+                lastError =
+                    "Hidden AppOpsManager(Context,IAppOpsService) " +
+                        "constructor not found."
+
+                return null
+            }
+
+            constructor.isAccessible =
+                true
+
+            val manager =
+                constructor.newInstance(
+                    context,
+                    internalService
+                ) as? AppOpsManager
+
+            if (
+                manager == null
+            ) {
+
+                lastError =
+                    "Constructed AppOpsManager returned NULL."
+
+                return null
+            }
+
+            appOpsManager =
+                manager
+
+            managerSource =
+                "Raw Android appops Binder"
+
+            return manager
+
+        } catch (e: Throwable) {
+
+            lastError =
+                "Raw AppOpsManager creation failed: " +
+                    describeThrowable(
+                        e
+                    )
+
+            return null
+        }
+    }
+
+    /*
+     * ============================================================
+     * GET USABLE CONTEXT
+     * ============================================================
+     */
+
+    private fun obtainUsableContext():
+        Context? {
+
+        /*
+         * ========================================================
+         * METHOD 1
+         *
+         * Shizuku-provided Context
+         * ========================================================
+         */
+
+        suppliedContext
+            ?.let {
+
+                contextSource =
+                    "Shizuku Context constructor"
+
+                return it
+            }
+
+        /*
+         * ========================================================
+         * METHOD 2
+         *
+         * ActivityThread system Context
+         * ========================================================
+         *
+         * Shizuku UserService is initialized using Android's
+         * ActivityThread system process infrastructure.
+         *
+         * Recover its system Context if our Context constructor
+         * was not used.
+         */
+
+        try {
+
+            val activityThreadClass =
+                Class.forName(
+                    "android.app.ActivityThread"
+                )
+
+            /*
+             * currentActivityThread()
+             */
+
+            val currentActivityThreadMethod =
+                activityThreadClass
+                    .getDeclaredMethod(
+                        "currentActivityThread"
+                    )
+
+            currentActivityThreadMethod.isAccessible =
+                true
+
+            val activityThread =
+                currentActivityThreadMethod.invoke(
+                    null
+                )
+
+            if (
+                activityThread == null
+            ) {
+
+                lastError =
+                    "ActivityThread.currentActivityThread() returned NULL."
+
+                return null
+            }
+
+            /*
+             * getSystemContext()
+             */
+
+            val getSystemContextMethod =
+                activityThreadClass
+                    .getDeclaredMethod(
+                        "getSystemContext"
+                    )
+
+            getSystemContextMethod.isAccessible =
+                true
+
+            val context =
+                getSystemContextMethod.invoke(
+                    activityThread
+                ) as? Context
+
+            if (
+                context == null
+            ) {
+
+                lastError =
+                    "ActivityThread.getSystemContext() returned NULL."
+
+                return null
+            }
+
+            suppliedContext =
+                context
+
+            contextSource =
+                "ActivityThread system Context"
+
+            return context
+
+        } catch (e: Throwable) {
+
+            lastError =
+                "System Context recovery failed: " +
+                    describeThrowable(
+                        e
+                    )
+
+            return null
+        }
+    }
+
+    /*
+     * ============================================================
+     * BUILD STATUS
+     * ============================================================
+     */
+
+    private fun buildStatus(
+        title: String
+    ): String {
+
+        return """
+            ===== BTMicFix VOICE ACCESS APPOPS =====
+            $title
+
+            Shizuku UserService UID:
+            ${Process.myUid()}
+
+            Context source:
+            $contextSource
+
+            AppOpsManager source:
+            $managerSource
+
+            Target package:
+            ${
+                if (
+                    targetPackage.isBlank()
+                ) {
+                    "NONE"
+                } else {
+                    targetPackage
+                }
+            }
+
+            Target UID:
+            $targetUid
+
+            RECORD_AUDIO watcher registered:
+            ${yesNo(watcherRegistered)}
+
+            RECORD_AUDIO current state:
+            ${
+                if (
+                    currentActive
+                ) {
+                    "ACTIVE"
+                } else {
+                    "INACTIVE"
+                }
+            }
+
+            Last error:
+            $lastError
+
+            =========================================
+        """.trimIndent()
+    }
+
+    /*
+     * ============================================================
+     * YES / NO
+     * ============================================================
+     */
+
+    private fun yesNo(
+        value: Boolean
+    ): String {
+
+        return if (
+            value
+        ) {
+
+            "YES"
+
+        } else {
+
+            "NO"
+        }
+    }
+
+    /*
+     * ============================================================
+     * ERROR DESCRIPTION
+     * ============================================================
+     */
+
+    private fun describeThrowable(
+        throwable: Throwable
+    ): String {
+
+        val actual =
+            if (
+                throwable is
+                InvocationTargetException
+            ) {
+
+                throwable.targetException
+                    ?: throwable
+
+            } else {
+
+                throwable
+            }
+
+        return (
+            actual.javaClass.simpleName +
+                ": " +
+                (
+                    actual.message
+                        ?: "no message"
+                    )
+            )
     }
 
     /*
@@ -769,67 +1155,8 @@ class VoiceAccessAppOpsService() :
             stopWatchLocked()
         }
 
-        System.exit(0)
+        System.exit(
+            0
+        )
     }
-
-    /*
-     * ============================================================
-     * ERROR HELPERS
-     * ============================================================
-     */
-
-    private fun failure(
-        title: String,
-        throwable: Throwable
-    ): String {
-
-        val actual =
-            unwrap(
-                throwable
-            )
-
-        return """
-            ===== BTMicFix VOICE ACCESS APPOPS =====
-            FAILED
-
-            $title
-
-            ${actual.javaClass.name}
-
-            ${actual.message}
-
-            ========================================
-        """.trimIndent()
-    }
-
-    private fun unwrap(
-        throwable: Throwable
-    ): Throwable {
-
-        return if (
-            throwable is
-            InvocationTargetException
-        ) {
-
-            throwable.targetException
-                ?: throwable
-
-        } else {
-
-            throwable
-        }
-    }
-
-    /*
-     * ============================================================
-     * CONSTANT
-     * ============================================================
-     */
-
-    companion object {
-
-        private const val
-            RECORD_AUDIO_OP =
-            "android:record_audio"
-    }
-    }
+}
