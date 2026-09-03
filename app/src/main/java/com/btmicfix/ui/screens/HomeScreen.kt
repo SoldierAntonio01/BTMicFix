@@ -26,6 +26,7 @@ import com.btmicfix.shizuku.LeAudioShizukuBridge
 import com.btmicfix.shizuku.ShizukuManager
 import com.btmicfix.ui.components.DeviceSelector
 import com.btmicfix.ui.components.ShizukuStatusCard
+import com.btmicfix.ui.components.VoiceAccessAutomationStatusCard
 import com.btmicfix.ui.components.StatusCard
 import com.btmicfix.ui.theme.*
 import kotlinx.coroutines.Dispatchers
@@ -316,6 +317,8 @@ fun HomeScreen(
                 shizukuManager =
                     shizukuManager
             )
+
+            VoiceAccessAutomationStatusCard()
 
             /*
              * ====================================================
