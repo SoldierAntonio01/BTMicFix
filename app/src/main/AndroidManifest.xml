@@ -4,6 +4,30 @@
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- ====================================================== -->
+    <!-- PACKAGE VISIBILITY                                     -->
+    <!-- ====================================================== -->
+
+    <!--
+        REQUIRED.
+
+        Android 11+ can hide installed applications from
+        PackageManager queries.
+
+        BTMicFix needs to resolve Voice Access's UID.
+    -->
+
+    <queries>
+
+        <package
+            android:name="com.google.android.apps.accessibility.voiceaccess" />
+
+    </queries>
+
+    <!-- ====================================================== -->
+    <!-- PERMISSIONS                                             -->
+    <!-- ====================================================== -->
+
     <uses-permission
         android:name="android.permission.BLUETOOTH_CONNECT" />
 
@@ -31,6 +55,10 @@
     <uses-permission
         android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- ====================================================== -->
+    <!-- FEATURES                                                -->
+    <!-- ====================================================== -->
+
     <uses-feature
         android:name="android.hardware.bluetooth"
         android:required="true" />
@@ -38,6 +66,10 @@
     <uses-feature
         android:name="android.software.companion_device_setup"
         android:required="true" />
+
+    <!-- ====================================================== -->
+    <!-- APPLICATION                                             -->
+    <!-- ====================================================== -->
 
     <application
         android:name=".BTMicFixApp"
@@ -95,12 +127,12 @@
         </service>
 
         <!--
-            VOICE ACCESS AUTOMATION
+            VOICE ACCESS AUTOMATION HOST
 
-            Android's system notification manager binds this service
-            only after the user grants Notification Access.
+            This service DOES NOT inspect notification text.
 
-            No notification polling loop is used.
+            Notification Access simply gives Android a stable
+            lifecycle host for the automation.
         -->
 
         <service
